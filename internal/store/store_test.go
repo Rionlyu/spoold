@@ -145,6 +145,40 @@ func TestReplayIgnoresInterruptedFinalRecord(t *testing.T) {
 	}
 }
 
+func TestReplayAcceptsCompleteFinalRecordWithoutNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/hook",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data[:len(data)-1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	if _, err := reopened.Get(item.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "spoold.journal"))

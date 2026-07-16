@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 )
 
@@ -16,6 +15,7 @@ var ErrBlockedAddress = errors.New("target resolves to a blocked network address
 func NewClient(allowPrivate bool, timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	transport.DialContext = dialer.DialContext
 	if !allowPrivate {
 		transport.DialContext = safeDialContext(dialer)
@@ -61,11 +61,21 @@ func safeDialContext(dialer *net.Dialer) func(context.Context, string, string) (
 		if err != nil {
 			return nil, err
 		}
+		var lastErr error
+		allowed := false
 		for _, ip := range addresses {
 			if blocked(ip) {
 				continue
 			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			allowed = true
+			connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return connection, nil
+			}
+			lastErr = err
+		}
+		if allowed {
+			return nil, fmt.Errorf("connect to target: %w", lastErr)
 		}
 		return nil, fmt.Errorf("%w: %s", ErrBlockedAddress, host)
 	}
@@ -104,9 +114,5 @@ func isCarrierGradeNAT(ip net.IP) bool {
 	if v4 == nil {
 		return false
 	}
-	value := uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3])
-	base := uint32(100)<<24 | uint32(64)<<16
-	maskBits, _ := strconv.Atoi("10")
-	mask := ^uint32(0) << (32 - maskBits)
-	return value&mask == base&mask
+	return v4[0] == 100 && v4[1]&0xc0 == 64
 }

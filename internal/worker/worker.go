@@ -126,7 +126,7 @@ func (p *Pool) deliver(ctx context.Context, item delivery.Delivery) {
 			return
 		}
 		p.succeeded.Add(1)
-		p.log.Info("delivery succeeded", "delivery_id", item.ID, "attempt", item.Attempts, "status", statusCode, "duration", elapsed)
+		p.log.Info("delivery succeeded", "delivery_id", item.ID, "attempt", item.Attempts, "status", statusCode, "duration_ms", elapsed.Milliseconds())
 		return
 	}
 
@@ -142,7 +142,7 @@ func (p *Pool) deliver(ctx context.Context, item delivery.Delivery) {
 
 	if terminal {
 		p.terminalFailure.Add(1)
-		p.log.Warn("delivery failed", "delivery_id", item.ID, "attempt", item.Attempts, "status", statusCode, "error", message, "duration", elapsed)
+		p.log.Warn("delivery failed", "delivery_id", item.ID, "attempt", item.Attempts, "status", statusCode, "error", message, "duration_ms", elapsed.Milliseconds())
 		return
 	}
 	p.retryableFailure.Add(1)

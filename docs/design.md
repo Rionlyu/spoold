@@ -30,6 +30,10 @@ request even if `spoold` crashes before recording the successful response.
 Every request includes stable delivery and attempt headers so a destination can
 deduplicate.
 
+Canceling leased work is best effort. It invalidates the worker's lease and
+prevents a later journal update, but an HTTP request already processed by the
+destination cannot be retracted.
+
 ## Persistence
 
 The journal is newline-delimited JSON. Each mutation appends the complete

@@ -92,11 +92,35 @@ func Clone(d Delivery) Delivery {
 	return d
 }
 
+func (d Delivery) MarshalJSON() ([]byte, error) {
+	type alias Delivery
+	value := struct {
+		alias
+		NextAttemptAt *time.Time `json:"nextAttemptAt,omitempty"`
+		LeaseUntil    *time.Time `json:"leaseUntil,omitempty"`
+	}{
+		alias: alias(d),
+	}
+	if !d.NextAttemptAt.IsZero() {
+		value.NextAttemptAt = &d.NextAttemptAt
+	}
+	if !d.LeaseUntil.IsZero() {
+		value.LeaseUntil = &d.LeaseUntil
+	}
+	return json.Marshal(value)
+}
+
 func normalize(req CreateRequest) (CreateRequest, error) {
 	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
+	if len(req.IdempotencyKey) > 256 {
+		return CreateRequest{}, errors.New("idempotency key must not exceed 256 bytes")
+	}
 	req.TargetURL = strings.TrimSpace(req.TargetURL)
 	if req.TargetURL == "" {
 		return CreateRequest{}, errors.New("target URL is required")
+	}
+	if len(req.TargetURL) > 4096 {
+		return CreateRequest{}, errors.New("target URL must not exceed 4096 bytes")
 	}
 
 	parsed, err := url.Parse(req.TargetURL)
@@ -131,18 +155,24 @@ func normalize(req CreateRequest) (CreateRequest, error) {
 		return CreateRequest{}, errors.New("max attempts must be between 1 and 100")
 	}
 
-	req.Headers = cloneHeaders(req.Headers)
+	normalizedHeaders := make(map[string]string, len(req.Headers))
 	for name, value := range req.Headers {
 		canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
 		if canonical == "" || !validHeaderName(canonical) {
 			return CreateRequest{}, fmt.Errorf("invalid header name %q", name)
 		}
+		if reservedHeader(canonical) {
+			return CreateRequest{}, fmt.Errorf("header %q is managed by spoold", name)
+		}
 		if strings.ContainsAny(value, "\r\n") {
 			return CreateRequest{}, fmt.Errorf("header %q contains a newline", name)
 		}
-		delete(req.Headers, name)
-		req.Headers[canonical] = value
+		if _, exists := normalizedHeaders[canonical]; exists {
+			return CreateRequest{}, fmt.Errorf("header %q is duplicated after canonicalization", name)
+		}
+		normalizedHeaders[canonical] = value
 	}
+	req.Headers = normalizedHeaders
 
 	if len(req.Body) > 0 && !json.Valid(req.Body) {
 		return CreateRequest{}, errors.New("body must be valid JSON")
@@ -199,4 +229,21 @@ func validMethod(method string) bool {
 
 func validHeaderName(name string) bool {
 	return validMethod(name)
+}
+
+func reservedHeader(name string) bool {
+	switch name {
+	case "Connection",
+		"Content-Length",
+		"Host",
+		"Proxy-Connection",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+		"X-Spoold-Attempt",
+		"X-Spoold-Delivery-Id":
+		return true
+	default:
+		return false
+	}
 }

@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -29,10 +30,31 @@ func TestNewRejectsUnsafeOrMalformedInput(t *testing.T) {
 		{TargetURL: "https://example.com/hook#fragment"},
 		{TargetURL: "https://example.com", Body: json.RawMessage(`{`)},
 		{TargetURL: "https://example.com", Headers: map[string]string{"X-Test": "bad\nvalue"}},
+		{TargetURL: "https://example.com", Headers: map[string]string{"Content-Length": "5"}},
+		{TargetURL: "https://example.com", Headers: map[string]string{"x-test": "a", "X-Test": "b"}},
 	}
 	for _, request := range tests {
 		if _, _, err := New(request, time.Now()); err == nil {
 			t.Fatalf("New(%#v) succeeded", request)
 		}
+	}
+}
+
+func TestMarshalOmitsInactiveScheduleFields(t *testing.T) {
+	item := Delivery{
+		ID:          "test",
+		TargetURL:   "https://example.com",
+		Method:      "POST",
+		Status:      StatusSucceeded,
+		MaxAttempts: 1,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	data, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "nextAttemptAt") || strings.Contains(string(data), "leaseUntil") {
+		t.Fatalf("JSON contains inactive schedule fields: %s", data)
 	}
 }

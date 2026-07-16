@@ -1,6 +1,6 @@
 /bin/
-/data/
+/data/*
+!/data/.keep
 *.out
 *.prof
 .DS_Store
-

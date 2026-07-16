@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Rionlyu/spoold/internal/delivery"
@@ -86,6 +85,11 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, store.ErrIdempotencyConflict) {
 			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			return
+		}
+		if errors.Is(err, store.ErrPersistence) {
+			s.log.Error("persist delivery", "error", err)
+			writeError(w, http.StatusInternalServerError, "persistence_failed", "delivery could not be persisted")
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_delivery", err.Error())
@@ -196,7 +200,7 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", recorder.status,
-			"duration", time.Since(started),
+			"duration_ms", time.Since(started).Milliseconds(),
 		)
 	})
 }
@@ -259,8 +263,4 @@ func validStatus(status delivery.Status) bool {
 	default:
 		return false
 	}
-}
-
-func cleanPath(path string) string {
-	return strings.TrimSuffix(path, "/")
 }

@@ -20,6 +20,7 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency key was already used for a different request")
 	ErrInvalidTransition   = errors.New("invalid delivery state transition")
 	ErrStaleLease          = errors.New("delivery lease is no longer current")
+	ErrPersistence         = errors.New("delivery persistence failed")
 )
 
 type Store struct {
@@ -86,7 +87,7 @@ func (s *Store) Create(req delivery.CreateRequest, now time.Time) (delivery.Deli
 	}
 
 	if err := s.appendLocked(candidate, requestHash); err != nil {
-		return delivery.Delivery{}, false, err
+		return delivery.Delivery{}, false, fmt.Errorf("%w: %v", ErrPersistence, err)
 	}
 	s.setLocked(candidate, requestHash)
 	return delivery.Clone(candidate), true, nil
@@ -317,6 +318,15 @@ func (s *Store) replay() error {
 	for {
 		data, err := reader.ReadBytes('\n')
 		if err == io.EOF {
+			if len(data) > 0 {
+				var record journalRecord
+				if json.Unmarshal(data, &record) == nil {
+					line++
+					if err := s.applyRecord(record, line); err != nil {
+						return err
+					}
+				}
+			}
 			break
 		}
 		if err != nil {
@@ -328,17 +338,24 @@ func (s *Store) replay() error {
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("decode journal line %d: %w", line, err)
 		}
-		if record.Version != 1 {
-			return fmt.Errorf("journal line %d uses unsupported version %d", line, record.Version)
+		if err := s.applyRecord(record, line); err != nil {
+			return err
 		}
-		if record.Delivery.ID == "" {
-			return fmt.Errorf("journal line %d has no delivery id", line)
-		}
-		s.setLocked(record.Delivery, record.RequestHash)
 	}
 
 	if _, err := s.file.Seek(0, io.SeekEnd); err != nil {
 		return fmt.Errorf("seek journal end: %w", err)
 	}
+	return nil
+}
+
+func (s *Store) applyRecord(record journalRecord, line int) error {
+	if record.Version != 1 {
+		return fmt.Errorf("journal line %d uses unsupported version %d", line, record.Version)
+	}
+	if record.Delivery.ID == "" {
+		return fmt.Errorf("journal line %d has no delivery id", line)
+	}
+	s.setLocked(record.Delivery, record.RequestHash)
 	return nil
 }
