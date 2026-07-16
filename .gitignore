@@ -1,0 +1,6 @@
+/bin/
+/data/
+*.out
+*.prof
+.DS_Store
+
