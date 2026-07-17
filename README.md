@@ -11,7 +11,7 @@ The project is intentionally narrow. It demonstrates the reliability mechanics
 behind webhook delivery without hiding them behind a database or queueing
 framework:
 
-- append-only persistence and deterministic replay;
+- append-only mutation persistence, deterministic replay, and online compaction;
 - idempotent enqueueing with conflicting-reuse detection;
 - lease-based workers and stale-attempt protection;
 - at-least-once delivery with bounded retry cycles;
@@ -110,8 +110,17 @@ transition. Replay accepts a complete final record even if its newline was lost
 during shutdown, ignores an incomplete final append, and rejects corruption in
 any earlier complete record.
 
+Online compaction replaces superseded records with one current record per
+delivery. It is lossless: pending, in-flight, succeeded, failed, and canceled
+deliveries remain present, as do request fingerprints used for idempotency.
+Compaction briefly pauses store mutations while it writes and synchronizes a
+snapshot, then atomically replaces the journal. The default background check
+runs once per minute and compacts only when the journal is at least 64 MiB and
+contains at least twice as many physical records as live deliveries. A
+compaction failure is logged and counted but does not stop delivery processing.
+
 See [the design document](docs/design.md) for the state machine and durability
-boundary.
+boundary and replacement sequence.
 
 ## Network safety
 
@@ -139,6 +148,10 @@ exposed directly to an untrusted network.
       outbound request timeout (default 10s)
 -shutdown-timeout duration
       graceful shutdown timeout (default 10s)
+-compact-threshold-bytes int
+      minimum journal size for compaction; 0 disables (default 67108864)
+-compact-check-interval duration
+      journal compaction check interval (default 1m)
 ```
 
 Container builds listen on `0.0.0.0:8080` and store the journal under
@@ -160,6 +173,7 @@ make verify
 ```text
 cmd/spoold/          process configuration and graceful shutdown
 internal/api/        strict HTTP API and metrics exposition
+internal/compactor/  background journal compaction policy
 internal/delivery/   delivery model and request fingerprinting
 internal/store/      append-only journal and state transitions
 internal/target/     SSRF-aware HTTP transport
@@ -171,7 +185,8 @@ docs/design.md       semantics and deliberate non-goals
 ## Limitations
 
 - One process owns one journal file.
-- The journal grows until it is rotated offline; online compaction is planned.
+- Compaction retains terminal deliveries; there is no retention-based purge or
+  administrative compaction endpoint.
 - There is no authentication, tenant isolation, rate limiting, or per-target
   concurrency control.
 - Response bodies are retained only as a bounded error string, not as durable
@@ -181,4 +196,3 @@ docs/design.md       semantics and deliberate non-goals
 ## License
 
 MIT
-
