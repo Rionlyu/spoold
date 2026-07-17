@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Rionlyu/spoold/internal/api"
+	"github.com/Rionlyu/spoold/internal/compactor"
 	"github.com/Rionlyu/spoold/internal/store"
 	"github.com/Rionlyu/spoold/internal/target"
 	"github.com/Rionlyu/spoold/internal/worker"
@@ -25,6 +26,8 @@ func main() {
 		allowPrivateTargets = flag.Bool("allow-private-targets", false, "allow private and loopback delivery targets")
 		requestTimeout      = flag.Duration("request-timeout", 10*time.Second, "outbound request timeout")
 		shutdownTimeout     = flag.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
+		compactThreshold    = flag.Int64("compact-threshold-bytes", compactor.DefaultThresholdBytes, "minimum journal size for compaction (0 disables)")
+		compactInterval     = flag.Duration("compact-check-interval", compactor.DefaultCheckInterval, "journal compaction check interval")
 	)
 	flag.Parse()
 
@@ -46,6 +49,11 @@ func main() {
 		Concurrency: *concurrency,
 	})
 	pool.Start(ctx)
+	journalCompactor := compactor.New(journal, logger, compactor.Config{
+		ThresholdBytes: *compactThreshold,
+		CheckInterval:  *compactInterval,
+	})
+	journalCompactor.Start(ctx)
 
 	httpServer := &http.Server{
 		Addr:              *listen,
@@ -62,6 +70,8 @@ func main() {
 			"journal", *journalPath,
 			"workers", *concurrency,
 			"allow_private_targets", *allowPrivateTargets,
+			"compact_threshold_bytes", *compactThreshold,
+			"compact_check_interval", *compactInterval,
 		)
 		serverErrors <- httpServer.ListenAndServe()
 	}()
@@ -83,5 +93,6 @@ func main() {
 	}
 	stop()
 	pool.Wait()
+	journalCompactor.Wait()
 	logger.Info("spoold stopped")
 }

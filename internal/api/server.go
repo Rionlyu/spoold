@@ -164,6 +164,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) renderMetrics(w http.ResponseWriter, _ *http.Request) {
 	counts := s.store.Counts()
+	journal := s.store.Stats()
 	runtime := worker.Metrics{}
 	if s.metrics != nil {
 		runtime = s.metrics.Metrics()
@@ -189,6 +190,16 @@ func (s *Server) renderMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "spoold_delivery_results_total{result=\"succeeded\"} %d\n", runtime.Succeeded)
 	fmt.Fprintf(w, "spoold_delivery_results_total{result=\"retryable_failure\"} %d\n", runtime.RetryableFailure)
 	fmt.Fprintf(w, "spoold_delivery_results_total{result=\"terminal_failure\"} %d\n", runtime.TerminalFailure)
+	fmt.Fprintln(w, "# HELP spoold_journal_size_bytes Current journal file size in bytes.")
+	fmt.Fprintln(w, "# TYPE spoold_journal_size_bytes gauge")
+	fmt.Fprintf(w, "spoold_journal_size_bytes %d\n", journal.JournalSizeBytes)
+	fmt.Fprintln(w, "# HELP spoold_journal_records Current physical journal record count.")
+	fmt.Fprintln(w, "# TYPE spoold_journal_records gauge")
+	fmt.Fprintf(w, "spoold_journal_records %d\n", journal.JournalRecords)
+	fmt.Fprintln(w, "# HELP spoold_journal_compactions_total Journal compaction attempts by result.")
+	fmt.Fprintln(w, "# TYPE spoold_journal_compactions_total counter")
+	fmt.Fprintf(w, "spoold_journal_compactions_total{result=\"succeeded\"} %d\n", journal.CompactionsSucceeded)
+	fmt.Fprintf(w, "spoold_journal_compactions_total{result=\"failed\"} %d\n", journal.CompactionsFailed)
 }
 
 func (s *Server) accessLog(next http.Handler) http.Handler {

@@ -44,12 +44,45 @@ A final partial line is treated as an interrupted append and ignored. Corrupt
 complete records fail startup rather than silently discarding acknowledged
 state.
 
+### Online compaction
+
+Compaction is a lossless replacement of superseded physical records, not a
+retention policy. The store mutex remains held for the snapshot, so creates,
+claims, completions, retries, and cancellations pause briefly. Every live
+delivery is written exactly once in delivery-ID order, including pending,
+in-flight, succeeded, failed, and canceled deliveries. The associated request
+fingerprint is carried forward so idempotency behavior is unchanged.
+
+The atomic replacement sequence is:
+
+1. Create a temporary compaction file in the journal directory.
+2. Write the current record for every delivery in deterministic order.
+3. Synchronize the temporary file.
+4. Atomically rename it over the journal path.
+5. Synchronize the journal directory.
+6. Switch future appends to the replacement descriptor, then close the old
+   descriptor.
+
+If compaction fails before the rename, the original journal remains active and
+the temporary file is removed. If an error occurs after the rename, the store
+adopts the replacement descriptor before returning the error, so subsequent
+appends remain recoverable. Abandoned temporary compaction files are removed
+when the store opens. Failures are counted and logged but are non-fatal to the
+service.
+
+The background compactor checks once per minute by default. It runs only when
+the journal is at least 64 MiB and its physical record count is at least twice
+the live-delivery count. The byte threshold and check interval are configurable,
+and a zero byte threshold disables automatic compaction. There is deliberately
+no administrative HTTP endpoint and no purge operation.
+
 ## Concurrency
 
 State transitions are serialized by the store. Claims record a lease and
 increment the attempt number before a worker performs network I/O. Completion
 updates include the attempt number; a late worker cannot overwrite a newer
-claim.
+claim. Compaction uses the same serialization boundary, trading a brief mutation
+pause for a snapshot that cannot omit or reorder a concurrent state change.
 
 ## Networking
 

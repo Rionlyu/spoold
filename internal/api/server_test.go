@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Rionlyu/spoold/internal/delivery"
 	"github.com/Rionlyu/spoold/internal/store"
@@ -92,12 +94,32 @@ func TestRejectsUnknownJSONField(t *testing.T) {
 	}
 }
 
-func TestMetricsExposeDeliveryCounts(t *testing.T) {
-	server, _ := newTestServer(t)
+func TestMetricsExposeDeliveryAndJournalHealth(t *testing.T) {
+	server, journal := newTestServer(t)
 	request(t, server, http.MethodPost, "/v1/deliveries", `{"targetUrl":"https://example.com"}`)
+	if _, err := journal.ClaimDue(time.Now().Add(time.Minute), time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	stats := journal.Stats()
+
 	got := request(t, server, http.MethodGet, "/metrics", "")
-	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `spoold_deliveries{status="pending"} 1`) {
+	if got.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+	}
+	body := got.Body.String()
+	for _, metric := range []string{
+		`spoold_deliveries{status="in_flight"} 1`,
+		"spoold_journal_size_bytes " + strconv.FormatInt(stats.JournalSizeBytes, 10),
+		"spoold_journal_records 1",
+		`spoold_journal_compactions_total{result="succeeded"} 1`,
+		`spoold_journal_compactions_total{result="failed"} 0`,
+	} {
+		if !strings.Contains(body, metric) {
+			t.Errorf("metrics do not contain %q:\n%s", metric, body)
+		}
 	}
 }
 
