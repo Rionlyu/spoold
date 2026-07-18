@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Rionlyu/spoold/internal/api"
+	"github.com/Rionlyu/spoold/internal/buildinfo"
 	"github.com/Rionlyu/spoold/internal/compactor"
 	"github.com/Rionlyu/spoold/internal/store"
 	"github.com/Rionlyu/spoold/internal/target"
@@ -37,6 +38,7 @@ type config struct {
 	shutdownTimeout     time.Duration
 	compactThreshold    int64
 	compactInterval     time.Duration
+	showVersion         bool
 }
 
 func main() {
@@ -47,6 +49,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	cfg, code := parseConfig(args, stderr)
 	if code != 0 {
 		return code
+	}
+	if cfg.showVersion {
+		fmt.Fprintf(stdout, "spoold %s\n", buildinfo.String())
+		return 0
 	}
 
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
@@ -155,12 +161,16 @@ func parseConfig(args []string, stderr io.Writer) (config, int) {
 	flags.DurationVar(&cfg.shutdownTimeout, "shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
 	flags.Int64Var(&cfg.compactThreshold, "compact-threshold-bytes", compactor.DefaultThresholdBytes, "minimum journal size for compaction (0 disables size-based compaction)")
 	flags.DurationVar(&cfg.compactInterval, "compact-check-interval", compactor.DefaultCheckInterval, "journal maintenance interval")
+	flags.BoolVar(&cfg.showVersion, "version", false, "print version information")
 	if err := flags.Parse(args); err != nil {
 		return config{}, 2
 	}
 	if flags.NArg() != 0 {
 		fmt.Fprintln(stderr, "spoold: positional arguments are not supported")
 		return config{}, 2
+	}
+	if cfg.showVersion {
+		return cfg, 0
 	}
 
 	switch {

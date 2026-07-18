@@ -29,6 +29,16 @@ func TestRunReturnsFailureWhenAddressIsAlreadyInUse(t *testing.T) {
 	}
 }
 
+func TestRunPrintsVersionWithoutStarting(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-version"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "spoold dev") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestParseConfigRejectsUnsafeValues(t *testing.T) {
 	tests := [][]string{
 		{"-workers", "0"},

@@ -1,6 +1,7 @@
 .git
 .github
 bin
+dist
 data/*
 !data/.keep
 *.out

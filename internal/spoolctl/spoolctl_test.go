@@ -304,6 +304,7 @@ func TestCommandUsageExitCodes(t *testing.T) {
 	}{
 		{name: "no command", code: 2, text: "Usage:"},
 		{name: "help", args: []string{"help"}, code: 0, text: "crash-safe HTTP deliveries"},
+		{name: "version", args: []string{"version"}, code: 0, text: "spoolctl dev"},
 		{name: "unknown", args: []string{"unknown"}, code: 2, text: "unknown command"},
 		{name: "send missing URL", args: []string{"send"}, code: 2, text: "requires exactly one target URL"},
 		{name: "list extra argument", args: []string{"list", "extra"}, code: 2, text: "does not accept"},

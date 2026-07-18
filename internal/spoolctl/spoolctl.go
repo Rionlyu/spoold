@@ -18,6 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/Rionlyu/spoold/internal/buildinfo"
 	"github.com/Rionlyu/spoold/internal/delivery"
 )
 
@@ -103,6 +104,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = runDeliveryCommand(ctx, "retry", http.MethodPost, args[1:], stdout, stderr)
 	case "cancel":
 		err = runDeliveryCommand(ctx, "cancel", http.MethodPost, args[1:], stdout, stderr)
+	case "version":
+		fmt.Fprintf(stdout, "spoolctl %s\n", buildinfo.String())
+		return 0
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -388,6 +392,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  get      inspect one delivery")
 	fmt.Fprintln(output, "  retry    start a new retry cycle for a failed delivery")
 	fmt.Fprintln(output, "  cancel   cancel pending or in-flight delivery work")
+	fmt.Fprintln(output, "  version  print version information")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Set SPOOLD_URL to override the default http://127.0.0.1:8080 API.")
 }

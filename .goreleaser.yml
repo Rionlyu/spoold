@@ -1,0 +1,133 @@
+version: 2
+
+project_name: spoold
+
+gomod:
+  proxy: true
+
+builds:
+  - id: spoold
+    main: ./cmd/spoold
+    binary: spoold
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/Rionlyu/spoold/internal/buildinfo.Version={{ .Version }}
+        -X github.com/Rionlyu/spoold/internal/buildinfo.Commit={{ .Commit }}
+        -X github.com/Rionlyu/spoold/internal/buildinfo.Date={{ .CommitDate }}
+  - id: spoolctl
+    main: ./cmd/spoolctl
+    binary: spoolctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/Rionlyu/spoold/internal/buildinfo.Version={{ .Version }}
+        -X github.com/Rionlyu/spoold/internal/buildinfo.Commit={{ .Commit }}
+        -X github.com/Rionlyu/spoold/internal/buildinfo.Date={{ .CommitDate }}
+
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}_{{ .Version }}_source"
+
+archives:
+  - ids:
+      - spoold
+      - spoolctl
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: true
+    builds_info:
+      mtime: "{{ .CommitTimestamp }}"
+    files:
+      - LICENSE
+      - README.md
+      - SECURITY.md
+      - CONTRIBUTING.md
+      - CODE_OF_CONDUCT.md
+      - docs/design.md
+      - docs/product-direction.md
+      - docs/launch-readiness.md
+
+sboms:
+  - artifacts: archive
+  - id: source
+    artifacts: source
+
+checksum:
+  name_template: checksums.txt
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+dockers_v2:
+  - id: spoold
+    ids:
+      - spoold
+    images:
+      - ghcr.io/rionlyu/spoold
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if not .IsPrerelease }}latest{{ end }}"
+    dockerfile: .goreleaser.Dockerfile
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.name: "{{ .ProjectName }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
+      org.opencontainers.image.description: "Crash-safe local HTTP delivery spool"
+      org.opencontainers.image.licenses: MIT
+    annotations:
+      org.opencontainers.image.description: "Crash-safe local HTTP delivery spool"
+
+docker_signs:
+  - cmd: cosign
+    output: true
+    args:
+      - sign
+      - "${artifact}"
+      - "--yes"
+
+report_sizes: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

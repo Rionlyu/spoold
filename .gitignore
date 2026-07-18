@@ -1,4 +1,5 @@
 /bin/
+/dist/
 /data/*
 !/data/.keep
 *.out
