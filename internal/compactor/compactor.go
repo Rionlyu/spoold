@@ -23,6 +23,7 @@ type Config struct {
 
 type journalStore interface {
 	Stats() store.Stats
+	Ready() error
 	Compact() error
 	PruneTerminal(time.Time) (int, error)
 }
@@ -77,8 +78,14 @@ func (c *Compactor) run(ctx context.Context) {
 }
 
 func (c *Compactor) maintain() {
+	started := time.Now()
+	if err := c.store.Ready(); err != nil {
+		c.log.Warn("journal persistence unhealthy; attempting repair", "error", err)
+		_ = c.compact("persistence_repair", started)
+		return
+	}
+
 	if c.retention > 0 {
-		started := time.Now()
 		pruned, err := c.store.PruneTerminal(started.Add(-c.retention))
 		if err != nil {
 			c.log.Warn("journal retention failed", "error", err)

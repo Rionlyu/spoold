@@ -147,6 +147,29 @@ func TestCompactionFailureIsNonFatal(t *testing.T) {
 	compactor.Wait()
 }
 
+func TestMaintenanceRepairsUnreadyJournalBelowThreshold(t *testing.T) {
+	journal := &fakeStore{
+		stats: store.Stats{
+			JournalSizeBytes: 10,
+			JournalRecords:   1,
+			LiveDeliveries:   1,
+		},
+		readyErr: errors.New("injected persistence failure"),
+	}
+	compactor := New(journal, discardLogger(), Config{
+		ThresholdBytes: 100,
+	})
+
+	compactor.maintain()
+
+	if got := journal.compactCalls(); got != 1 {
+		t.Fatalf("Compact() calls = %d, want 1", got)
+	}
+	if err := journal.Ready(); err != nil {
+		t.Fatalf("Ready() after repair = %v, want nil", err)
+	}
+}
+
 func TestRetentionPrunesTerminalDeliveriesAndCompactsTombstones(t *testing.T) {
 	now := time.Now()
 	journal := &fakeStore{
@@ -181,12 +204,19 @@ type fakeStore struct {
 	calls    int
 	failures int
 	items    []time.Time
+	readyErr error
 }
 
 func (s *fakeStore) Stats() store.Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stats
+}
+
+func (s *fakeStore) Ready() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyErr
 }
 
 func (s *fakeStore) Compact() error {
@@ -201,6 +231,7 @@ func (s *fakeStore) Compact() error {
 	s.stats.JournalSizeBytes /= 2
 	s.stats.JournalRecords = s.stats.LiveDeliveries
 	s.stats.CompactionsSucceeded++
+	s.readyErr = nil
 	return nil
 }
 
