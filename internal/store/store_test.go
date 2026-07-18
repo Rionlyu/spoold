@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -485,7 +486,7 @@ func assertNoCompactionFiles(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if len(entry.Name()) >= len(compactionPrefix(path)) && entry.Name()[:len(compactionPrefix(path))] == compactionPrefix(path) {
+		if strings.HasPrefix(entry.Name(), compactionPrefix(path)) {
 			t.Fatalf("abandoned compaction file %q", entry.Name())
 		}
 	}

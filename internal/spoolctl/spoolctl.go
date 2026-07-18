@@ -74,6 +74,13 @@ type client struct {
 	httpClient *http.Client
 }
 
+type apiRequest struct {
+	method string
+	path   string
+	query  url.Values
+	body   any
+}
+
 // Run executes spoolctl and returns a process exit code.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -88,11 +95,11 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "list":
 		err = runList(ctx, args[1:], stdout, stderr)
 	case "get":
-		err = runMutation(ctx, "get", http.MethodGet, args[1:], stdout, stderr)
+		err = runDeliveryCommand(ctx, "get", http.MethodGet, args[1:], stdout, stderr)
 	case "retry":
-		err = runMutation(ctx, "retry", http.MethodPost, args[1:], stdout, stderr)
+		err = runDeliveryCommand(ctx, "retry", http.MethodPost, args[1:], stdout, stderr)
 	case "cancel":
-		err = runMutation(ctx, "cancel", http.MethodPost, args[1:], stdout, stderr)
+		err = runDeliveryCommand(ctx, "cancel", http.MethodPost, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -158,13 +165,17 @@ func runSend(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return usageError{err}
 	}
 	var item delivery.Delivery
-	status, err := api.do(ctx, http.MethodPost, "/v1/deliveries", createRequest{
-		IdempotencyKey: *idempotencyKey,
-		TargetURL:      flags.Arg(0),
-		Method:         *method,
-		Headers:        headers,
-		Body:           body,
-		MaxAttempts:    *maxAttempts,
+	status, err := api.do(ctx, apiRequest{
+		method: http.MethodPost,
+		path:   "/v1/deliveries",
+		body: createRequest{
+			IdempotencyKey: *idempotencyKey,
+			TargetURL:      flags.Arg(0),
+			Method:         *method,
+			Headers:        headers,
+			Body:           body,
+			MaxAttempts:    *maxAttempts,
+		},
 	}, &item)
 	if err != nil {
 		return err
@@ -177,8 +188,7 @@ func runSend(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	if status == http.StatusCreated {
 		action = "queued"
 	}
-	printDeliveries(stdout, action, []delivery.Delivery{item}, false)
-	return nil
+	return printDeliveries(stdout, action, []delivery.Delivery{item}, false)
 }
 
 func runList(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -212,17 +222,20 @@ func runList(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		query.Set("status", *status)
 	}
 	var response listResponse
-	if _, err := api.do(ctx, http.MethodGet, "/v1/deliveries?"+query.Encode(), nil, &response); err != nil {
+	if _, err := api.do(ctx, apiRequest{
+		method: http.MethodGet,
+		path:   "/v1/deliveries",
+		query:  query,
+	}, &response); err != nil {
 		return err
 	}
 	if *jsonOutput {
 		return writeJSON(stdout, response)
 	}
-	printDeliveries(stdout, "", response.Deliveries, true)
-	return nil
+	return printDeliveries(stdout, "", response.Deliveries, true)
 }
 
-func runMutation(ctx context.Context, command, method string, args []string, stdout, stderr io.Writer) error {
+func runDeliveryCommand(ctx context.Context, command, method string, args []string, stdout, stderr io.Writer) error {
 	flags := newFlagSet(command, stderr)
 	server := flags.String("server", serverURL(), "spoold API base URL")
 	jsonOutput := flags.Bool("json", false, "print the API response as JSON")
@@ -248,15 +261,22 @@ func runMutation(ctx context.Context, command, method string, args []string, std
 		path += "/" + command
 	}
 	var item delivery.Delivery
-	if _, err := api.do(ctx, method, path, nil, &item); err != nil {
+	if _, err := api.do(ctx, apiRequest{
+		method: method,
+		path:   path,
+	}, &item); err != nil {
 		return err
 	}
 	if *jsonOutput {
 		return writeJSON(stdout, item)
 	}
-	printDeliveries(stdout, command, []delivery.Delivery{item}, false)
+	if err := printDeliveries(stdout, command, []delivery.Delivery{item}, false); err != nil {
+		return err
+	}
 	if item.LastError != "" {
-		fmt.Fprintf(stdout, "last error: %s\n", item.LastError)
+		if _, err := fmt.Fprintf(stdout, "last error: %s\n", item.LastError); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -308,7 +328,7 @@ func readBody(inline, path string, stdin io.Reader) (json.RawMessage, error) {
 	return json.RawMessage(body), nil
 }
 
-func printDeliveries(output io.Writer, action string, items []delivery.Delivery, header bool) {
+func printDeliveries(output io.Writer, action string, items []delivery.Delivery, header bool) error {
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
 	if header {
 		fmt.Fprintln(table, "ID\tSTATUS\tATTEMPTS\tMETHOD\tTARGET")
@@ -328,7 +348,7 @@ func printDeliveries(output io.Writer, action string, items []delivery.Delivery,
 			item.TargetURL,
 		)
 	}
-	_ = table.Flush()
+	return table.Flush()
 }
 
 func writeJSON(output io.Writer, value any) error {
@@ -382,27 +402,24 @@ func newClient(rawURL string) (*client, error) {
 	}, nil
 }
 
-func (c *client) do(ctx context.Context, method, path string, requestBody, responseBody any) (int, error) {
+func (c *client) do(ctx context.Context, spec apiRequest, responseBody any) (int, error) {
 	endpoint := *c.baseURL
-	parts := strings.SplitN(path, "?", 2)
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + parts[0]
-	if len(parts) == 2 {
-		endpoint.RawQuery = parts[1]
-	}
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + spec.path
+	endpoint.RawQuery = spec.query.Encode()
 
 	var body io.Reader
-	if requestBody != nil {
-		encoded, err := json.Marshal(requestBody)
+	if spec.body != nil {
+		encoded, err := json.Marshal(spec.body)
 		if err != nil {
 			return 0, fmt.Errorf("encode request: %w", err)
 		}
 		body = bytes.NewReader(encoded)
 	}
-	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
+	request, err := http.NewRequestWithContext(ctx, spec.method, endpoint.String(), body)
 	if err != nil {
 		return 0, fmt.Errorf("create request: %w", err)
 	}
-	if requestBody != nil {
+	if spec.body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Accept", "application/json")
@@ -421,17 +438,18 @@ func (c *client) do(ctx context.Context, method, path string, requestBody, respo
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var remote errorResponse
-		if err := json.Unmarshal(responseData, &remote); err != nil {
-			return response.StatusCode, apiError{
-				StatusCode: response.StatusCode,
-				Message:    strings.TrimSpace(string(responseData)),
-			}
+		apiErr := apiError{StatusCode: response.StatusCode}
+		if json.Unmarshal(responseData, &remote) == nil {
+			apiErr.Code = remote.Error.Code
+			apiErr.Message = strings.TrimSpace(remote.Error.Message)
 		}
-		return response.StatusCode, apiError{
-			StatusCode: response.StatusCode,
-			Code:       remote.Error.Code,
-			Message:    remote.Error.Message,
+		if apiErr.Message == "" {
+			apiErr.Message = strings.TrimSpace(string(responseData))
 		}
+		if apiErr.Message == "" {
+			apiErr.Message = http.StatusText(response.StatusCode)
+		}
+		return response.StatusCode, apiErr
 	}
 	if responseBody == nil {
 		return response.StatusCode, nil
