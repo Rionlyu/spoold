@@ -98,7 +98,7 @@ dockers_v2:
       - ghcr.io/rionlyu/spoold
     tags:
       - "{{ .Tag }}"
-      - "{{ if not .IsPrerelease }}latest{{ end }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
     dockerfile: .goreleaser.Dockerfile
     platforms:
       - linux/amd64
