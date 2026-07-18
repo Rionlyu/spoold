@@ -38,20 +38,47 @@ destination cannot be retracted.
 
 The journal is newline-delimited JSON. Each mutation appends the complete
 current delivery record under a versioned envelope and calls `fsync` before
-returning. Replay keeps the last valid record for each delivery.
+returning. Creation of a new journal also synchronizes its directory before the
+first enqueue can be acknowledged. Replay keeps the last valid record for each
+delivery.
 
 A final partial line is treated as an interrupted append and ignored. Corrupt
 complete records fail startup rather than silently discarding acknowledged
 state.
 
+One process owns a journal through a stable adjacent lock file. A competing
+process fails startup instead of interleaving writes. An append or sync failure
+makes persistence readiness sticky: new mutations fail until a successful
+compaction establishes and synchronizes a replacement journal. The next enabled
+maintenance pass attempts that repair even below the size threshold. Liveness
+remains separate so an operator can distinguish a running process from a
+durable one.
+
+Journal format version 2 can record either a complete delivery or a deletion
+tombstone. Replay remains compatible with version 1 records.
+
+### Capacity and retention
+
+The physical journal has a configurable admission limit, 1 GiB by default.
+Crossing it rejects only new deliveries; idempotent lookup and transitions for
+already accepted work remain available. This keeps existing work recoverable
+without allowing unbounded new commitments.
+
+Terminal retention defaults to seven days. Maintenance writes deletion
+tombstones for expired succeeded, failed, and canceled deliveries, then
+compacts them away. Their idempotency keys expire at the same time. Pending and
+in-flight deliveries are never removed by retention. Setting retention to zero
+keeps terminal deliveries indefinitely.
+
 ### Online compaction
 
 Compaction is a lossless replacement of superseded physical records, not a
-retention policy. The store mutex remains held for the snapshot, so creates,
-claims, completions, retries, and cancellations pause briefly. Every live
-delivery is written exactly once in delivery-ID order, including pending,
-in-flight, succeeded, failed, and canceled deliveries. The associated request
-fingerprint is carried forward so idempotency behavior is unchanged.
+retention policy: retention decides which terminal records are still live
+before compaction begins. The store mutex remains held for the snapshot, so
+creates, claims, completions, retries, and cancellations pause briefly. Every
+retained delivery is written exactly once in delivery-ID order, including
+pending, in-flight, succeeded, failed, and canceled deliveries. The associated
+request fingerprint is carried forward so idempotency behavior is unchanged.
 
 The atomic replacement sequence is:
 
@@ -64,17 +91,20 @@ The atomic replacement sequence is:
    descriptor.
 
 If compaction fails before the rename, the original journal remains active and
-the temporary file is removed. If an error occurs after the rename, the store
-adopts the replacement descriptor before returning the error, so subsequent
-appends remain recoverable. Abandoned temporary compaction files are removed
-when the store opens. Failures are counted and logged but are non-fatal to the
-service.
+the temporary file is removed. If an error occurs after the rename but before
+directory synchronization, the store adopts the replacement descriptor but
+marks persistence unready and blocks mutations until a later compaction repairs
+the durability boundary. An error after directory synchronization still adopts
+the durable replacement and subsequent appends remain recoverable. Abandoned
+temporary compaction files are removed when the store opens. Failures are
+counted and logged rather than terminating the process.
 
-The background compactor checks once per minute by default. It runs only when
-the journal is at least 64 MiB and its physical record count is at least twice
-the live-delivery count. The byte threshold and check interval are configurable,
-and a zero byte threshold disables automatic compaction. There is deliberately
-no administrative HTTP endpoint and no purge operation.
+The background compactor checks once per minute by default. Size-based
+compaction runs only when the journal is at least 64 MiB and its physical record
+count is at least twice the live-delivery count. Retention and persistence
+repair are evaluated independently. The byte threshold and check interval are
+configurable, and a zero byte threshold disables size-based compaction. There
+is deliberately no administrative HTTP endpoint and no purge operation.
 
 ## Concurrency
 
@@ -84,6 +114,11 @@ updates include the attempt number; a late worker cannot overwrite a newer
 claim. Compaction uses the same serialization boundary, trading a brief mutation
 pause for a snapshot that cannot omit or reorder a concurrent state change.
 
+Workers also reserve target origins while claiming work. The default allows one
+active request per scheme/host/port while still using the global worker pool,
+so an unavailable destination cannot occupy every worker. The limit is
+configurable.
+
 ## Networking
 
 Only HTTP and HTTPS targets are accepted. User information and URL fragments
@@ -91,10 +126,13 @@ are rejected. The production-default dialer rejects loopback, private,
 link-local, unspecified, and multicast addresses after DNS resolution.
 
 Local targets can be enabled explicitly for development and integration tests.
+The control API listens on loopback by default. On Linux and macOS it can
+instead use an owner-only Unix socket, which is the preferred boundary on a
+multi-user host.
 
 ## Non-goals for v0.1
 
-- Multi-process access to one journal.
+- Sharing one journal between processes.
 - Distributed worker coordination.
 - Exactly-once delivery.
 - Arbitrary scheduling or recurring jobs.
