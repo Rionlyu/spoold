@@ -2,14 +2,16 @@
 
 [![CI](https://github.com/Rionlyu/spoold/actions/workflows/ci.yml/badge.svg)](https://github.com/Rionlyu/spoold/actions/workflows/ci.yml)
 
-`spoold` is a small, durable HTTP delivery daemon. An application enqueues an
-outbound request once; `spoold` synchronizes it to disk before acknowledging
-the request, delivers it in the background, and retries transient failures with
-bounded exponential backoff.
+`spoold` is durable curl for programs that cannot afford to lose an outbound
+HTTP request. Submit a delivery to the local daemon; `spoold` synchronizes it to
+disk before acknowledging the request, delivers it in the background, and
+resumes bounded retries after process termination, reboot, destination failure,
+or network loss.
 
-The project is intentionally narrow. It demonstrates the reliability mechanics
-behind webhook delivery without hiding them behind a database or queueing
-framework:
+It is intentionally a local delivery spool, not a hosted webhook platform or
+general message broker. One self-contained daemon and one owner-only journal
+provide the reliability boundary without PostgreSQL, Redis, Kafka, a cloud
+account, or a language-specific SDK:
 
 - append-only mutation persistence, deterministic replay, and online compaction;
 - idempotent enqueueing with conflicting-reuse detection;
@@ -38,32 +40,32 @@ go run ./examples/receiver
 Enqueue a delivery:
 
 ```sh
-curl -i http://127.0.0.1:8080/v1/deliveries \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "idempotencyKey": "build-2026-07-16",
-    "targetUrl": "http://127.0.0.1:9090/events",
-    "headers": {
-      "X-Event-Type": "build.completed"
-    },
-    "body": {
-      "repository": "spoold",
-      "result": "passed"
-    },
-    "maxAttempts": 5
-  }'
+./bin/spoolctl send \
+  --idempotency-key build-2026-07-16 \
+  --header 'X-Event-Type: build.completed' \
+  --data '{"repository":"spoold","result":"passed"}' \
+  --max-attempts 5 \
+  http://127.0.0.1:9090/events
 ```
 
-The response is `201 Created` after the journal entry has been synchronized.
-Submitting the same request and idempotency key returns the original delivery
-with `200 OK`. Reusing that key for different content returns `409 Conflict`.
+`spoolctl` prints `queued` only after the journal entry has been synchronized.
+Submitting the same request and idempotency key prints `existing` with the
+original delivery. Reusing that key for different content fails with an
+idempotency conflict.
 
 Inspect the delivery and metrics:
 
 ```sh
-curl http://127.0.0.1:8080/v1/deliveries/<id>
+./bin/spoolctl list
+./bin/spoolctl get <id>
+./bin/spoolctl retry <failed-id>
 curl http://127.0.0.1:8080/metrics
 ```
+
+Every `spoolctl` command accepts `--server`; `SPOOLD_URL` changes its default.
+Use `--json` for machine-readable output and `spoolctl help` for the complete
+command list. The HTTP API remains the stable integration surface for programs
+that do not use the CLI.
 
 ## API
 
@@ -172,15 +174,20 @@ make verify
 
 ```text
 cmd/spoold/          process configuration and graceful shutdown
+cmd/spoolctl/        curl-like local delivery client
 internal/api/        strict HTTP API and metrics exposition
 internal/compactor/  background journal compaction policy
 internal/delivery/   delivery model and request fingerprinting
+internal/spoolctl/   client commands, API transport, and output
 internal/store/      append-only journal and state transitions
 internal/target/     SSRF-aware HTTP transport
 internal/worker/     leases, delivery, retry policy, and counters
 examples/receiver/   local HTTP destination for the quick start
 docs/design.md       semantics and deliberate non-goals
 ```
+
+The focused product decision and competitive boundary are documented in
+[product direction](docs/product-direction.md).
 
 ## Limitations
 
