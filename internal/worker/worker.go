@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -266,5 +267,15 @@ func targetKey(targetURL string) string {
 	if err != nil {
 		return strings.ToLower(targetURL)
 	}
-	return strings.ToLower(parsed.Scheme + "://" + parsed.Host)
+	scheme := strings.ToLower(parsed.Scheme)
+	port := parsed.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(parsed.Hostname()), port)
 }

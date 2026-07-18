@@ -224,3 +224,20 @@ func TestBackoffIsBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestTargetKeyNormalizesEquivalentOrigins(t *testing.T) {
+	tests := []struct {
+		target string
+		want   string
+	}{
+		{target: "https://EXAMPLE.com/path", want: "https://example.com:443"},
+		{target: "https://example.com:443/other", want: "https://example.com:443"},
+		{target: "http://example.com", want: "http://example.com:80"},
+		{target: "http://[2001:db8::1]/events", want: "http://[2001:db8::1]:80"},
+	}
+	for _, test := range tests {
+		if got := targetKey(test.target); got != test.want {
+			t.Errorf("targetKey(%q) = %q, want %q", test.target, got, test.want)
+		}
+	}
+}
