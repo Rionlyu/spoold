@@ -94,6 +94,42 @@ func TestRejectsUnknownJSONField(t *testing.T) {
 	}
 }
 
+func TestReadinessReflectsJournalAvailability(t *testing.T) {
+	server, journal := newTestServer(t)
+	if got := request(t, server, http.MethodGet, "/readyz", ""); got.Code != http.StatusOK {
+		t.Fatalf("ready status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(t, server, http.MethodGet, "/healthz", ""); got.Code != http.StatusOK {
+		t.Fatalf("health status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if got := request(t, server, http.MethodGet, "/readyz", ""); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unready status = %d, body = %s", got.Code, got.Body.String())
+	}
+}
+
+func TestCreateReturnsInsufficientStorageAtAdmissionLimit(t *testing.T) {
+	journal, err := store.OpenWithOptions(filepath.Join(t.TempDir(), "journal"), store.Options{
+		MaxJournalBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { journal.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(journal, nil, logger)
+
+	got := request(t, server, http.MethodPost, "/v1/deliveries", `{"targetUrl":"https://example.com"}`)
+	if got.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), "journal_full") {
+		t.Fatalf("body = %s", got.Body.String())
+	}
+}
+
 func TestStatusRecorderKeepsFirstResponseStatus(t *testing.T) {
 	response := httptest.NewRecorder()
 	recorder := &statusRecorder{
@@ -150,6 +186,8 @@ func TestMetricsExposeDeliveryAndJournalHealth(t *testing.T) {
 		`spoold_deliveries{status="in_flight"} 1`,
 		"spoold_journal_size_bytes " + strconv.FormatInt(stats.JournalSizeBytes, 10),
 		"spoold_journal_records 1",
+		"spoold_journal_max_bytes 0",
+		"spoold_journal_pruned_deliveries_total 0",
 		`spoold_journal_compactions_total{result="succeeded"} 1`,
 		`spoold_journal_compactions_total{result="failed"} 0`,
 	} {

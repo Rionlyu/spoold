@@ -52,7 +52,7 @@ func New(journal *store.Store, metrics metricsSource, logger *slog.Logger) *Serv
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
-	mux.HandleFunc("GET /readyz", server.health)
+	mux.HandleFunc("GET /readyz", server.ready)
 	mux.HandleFunc("GET /metrics", server.renderMetrics)
 	mux.HandleFunc("POST /v1/deliveries", server.create)
 	mux.HandleFunc("GET /v1/deliveries", server.list)
@@ -90,6 +90,10 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrPersistence) {
 			s.log.Error("persist delivery", "error", err)
 			writeError(w, http.StatusInternalServerError, "persistence_failed", "delivery could not be persisted")
+			return
+		}
+		if errors.Is(err, store.ErrJournalFull) {
+			writeError(w, http.StatusInsufficientStorage, "journal_full", "journal admission limit reached")
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_delivery", err.Error())
@@ -162,6 +166,15 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) ready(w http.ResponseWriter, _ *http.Request) {
+	if err := s.store.Ready(); err != nil {
+		s.log.Warn("journal not ready", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "journal persistence is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) renderMetrics(w http.ResponseWriter, _ *http.Request) {
 	counts := s.store.Counts()
 	journal := s.store.Stats()
@@ -196,6 +209,12 @@ func (s *Server) renderMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintln(w, "# HELP spoold_journal_records Current physical journal record count.")
 	fmt.Fprintln(w, "# TYPE spoold_journal_records gauge")
 	fmt.Fprintf(w, "spoold_journal_records %d\n", journal.JournalRecords)
+	fmt.Fprintln(w, "# HELP spoold_journal_max_bytes Configured journal admission limit in bytes; zero is unlimited.")
+	fmt.Fprintln(w, "# TYPE spoold_journal_max_bytes gauge")
+	fmt.Fprintf(w, "spoold_journal_max_bytes %d\n", journal.MaxJournalBytes)
+	fmt.Fprintln(w, "# HELP spoold_journal_pruned_deliveries_total Terminal deliveries removed by retention.")
+	fmt.Fprintln(w, "# TYPE spoold_journal_pruned_deliveries_total counter")
+	fmt.Fprintf(w, "spoold_journal_pruned_deliveries_total %d\n", journal.PrunedDeliveries)
 	fmt.Fprintln(w, "# HELP spoold_journal_compactions_total Journal compaction attempts by result.")
 	fmt.Fprintln(w, "# TYPE spoold_journal_compactions_total counter")
 	fmt.Fprintf(w, "spoold_journal_compactions_total{result=\"succeeded\"} %d\n", journal.CompactionsSucceeded)
