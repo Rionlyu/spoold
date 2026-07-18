@@ -491,23 +491,31 @@ func (s *Store) Compact() (err error) {
 	}
 	renamed = true
 	if err := s.runCompactionHook(compactionAfterRename); err != nil {
-		err = errors.Join(err, s.adoptCompactedLocked(temp, uint64(len(ids))))
+		err = s.failPersistenceLocked(errors.Join(
+			err,
+			s.adoptCompactedLocked(temp, uint64(len(ids))),
+		))
 		adopted = true
 		return err
 	}
 	if err := syncDirectory(filepath.Dir(s.path)); err != nil {
-		err = errors.Join(err, s.adoptCompactedLocked(temp, uint64(len(ids))))
+		err = s.failPersistenceLocked(errors.Join(
+			err,
+			s.adoptCompactedLocked(temp, uint64(len(ids))),
+		))
 		adopted = true
 		return err
 	}
 	if err := s.runCompactionHook(compactionAfterDirSync); err != nil {
 		err = errors.Join(err, s.adoptCompactedLocked(temp, uint64(len(ids))))
 		adopted = true
+		s.persistenceErr = nil
 		return err
 	}
 
 	if err := s.adoptCompactedLocked(temp, uint64(len(ids))); err != nil {
 		adopted = true
+		s.persistenceErr = nil
 		return err
 	}
 	adopted = true

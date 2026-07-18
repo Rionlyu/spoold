@@ -520,44 +520,67 @@ func TestCompactFailureBeforeRenameLeavesOriginalJournalWritable(t *testing.T) {
 	assertReplaysIDs(t, path, first.ID, second.ID)
 }
 
-func TestCompactFailureAfterReplacementKeepsSubsequentAppendsRecoverable(t *testing.T) {
-	for _, failureStage := range []compactionStage{compactionAfterRename, compactionAfterDirSync} {
-		t.Run(string(failureStage), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "spoold.journal")
-			store, err := Open(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			first := createTestDelivery(t, store, "first", time.Now())
-			claimed, err := store.ClaimDue(time.Now().Add(time.Second), time.Minute, 1)
-			if err != nil || len(claimed) != 1 {
-				t.Fatalf("ClaimDue() = %#v, %v", claimed, err)
-			}
-			if err := store.Succeed(first.ID, claimed[0].Attempts, 200, time.Now().Add(2*time.Second)); err != nil {
-				t.Fatal(err)
-			}
-
-			store.compactionHook = func(stage compactionStage) error {
-				if stage == failureStage {
-					return errors.New("injected failure")
-				}
-				return nil
-			}
-			if err := store.Compact(); err == nil {
-				t.Fatal("Compact() error = nil, want injected failure")
-			}
-			store.compactionHook = nil
-			second := createTestDelivery(t, store, "second", time.Now().Add(3*time.Second))
-			stats := store.Stats()
-			if stats.CompactionsFailed != 1 || stats.CompactionsSucceeded != 0 || stats.JournalRecords != 2 {
-				t.Fatalf("stats = %#v", stats)
-			}
-			if err := store.Close(); err != nil {
-				t.Fatal(err)
-			}
-			assertReplaysIDs(t, path, first.ID, second.ID)
-		})
+func TestCompactFailureAfterRenameRequiresDurabilityRepair(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, first := storeWithTransitionedDelivery(t, path)
+	store.compactionHook = func(stage compactionStage) error {
+		if stage == compactionAfterRename {
+			return errors.New("injected failure")
+		}
+		return nil
 	}
+	if err := store.Compact(); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Compact() error = %v, want %v", err, ErrPersistence)
+	}
+	if err := store.Ready(); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Ready() error = %v, want %v", err, ErrPersistence)
+	}
+	if _, _, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/blocked",
+	}, time.Now()); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Create() before repair error = %v, want %v", err, ErrPersistence)
+	}
+
+	store.compactionHook = nil
+	if err := store.Compact(); err != nil {
+		t.Fatalf("repairing Compact(): %v", err)
+	}
+	second := createTestDelivery(t, store, "second", time.Now().Add(3*time.Second))
+	stats := store.Stats()
+	if stats.CompactionsFailed != 1 || stats.CompactionsSucceeded != 1 || stats.JournalRecords != 2 {
+		t.Fatalf("stats = %#v", stats)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertReplaysIDs(t, path, first.ID, second.ID)
+}
+
+func TestCompactFailureAfterDirectorySyncKeepsSubsequentAppendsRecoverable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, first := storeWithTransitionedDelivery(t, path)
+	store.compactionHook = func(stage compactionStage) error {
+		if stage == compactionAfterDirSync {
+			return errors.New("injected failure")
+		}
+		return nil
+	}
+	if err := store.Compact(); err == nil {
+		t.Fatal("Compact() error = nil, want injected failure")
+	}
+	if err := store.Ready(); err != nil {
+		t.Fatalf("Ready() after durable replacement = %v", err)
+	}
+	store.compactionHook = nil
+	second := createTestDelivery(t, store, "second", time.Now().Add(3*time.Second))
+	stats := store.Stats()
+	if stats.CompactionsFailed != 1 || stats.CompactionsSucceeded != 0 || stats.JournalRecords != 2 {
+		t.Fatalf("stats = %#v", stats)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertReplaysIDs(t, path, first.ID, second.ID)
 }
 
 func TestOpenRemovesAbandonedCompactionFiles(t *testing.T) {
@@ -668,6 +691,23 @@ func createTestDelivery(t *testing.T, store *Store, key string, now time.Time) d
 		t.Fatal(err)
 	}
 	return item
+}
+
+func storeWithTransitionedDelivery(t *testing.T, path string) (*Store, delivery.Delivery) {
+	t.Helper()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := createTestDelivery(t, store, "first", time.Now())
+	claimed, err := store.ClaimDue(time.Now().Add(time.Second), time.Minute, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimDue() = %#v, %v", claimed, err)
+	}
+	if err := store.Succeed(first.ID, claimed[0].Attempts, 200, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	return store, first
 }
 
 func assertJournalIDsSorted(t *testing.T, path string) {
