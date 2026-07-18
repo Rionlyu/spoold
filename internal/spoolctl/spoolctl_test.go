@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -343,6 +344,38 @@ func TestRemoteAPIErrorIsActionable(t *testing.T) {
 	}
 }
 
+func TestRemoteAPIErrorFallsBackToHTTPStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{
+		"list",
+		"--server", server.URL,
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Service Unavailable") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestPrintDeliveriesReturnsWriteError(t *testing.T) {
+	err := printDeliveries(errorWriter{}, "", []delivery.Delivery{{
+		ID:          "delivery",
+		Status:      delivery.StatusPending,
+		MaxAttempts: 1,
+		Method:      http.MethodPost,
+		TargetURL:   "https://example.com/hook",
+	}}, false)
+	if err == nil {
+		t.Fatal("printDeliveries() error = nil")
+	}
+}
+
 func newSpooldServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
 	journal, err := store.Open(filepath.Join(t.TempDir(), "journal"))
@@ -358,6 +391,12 @@ func newSpooldServer(t *testing.T) (*httptest.Server, *store.Store) {
 	return server, journal
 }
 
-func testTime() (result time.Time) {
+func testTime() time.Time {
 	return time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
 }

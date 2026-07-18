@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -525,7 +526,7 @@ func removeAbandonedCompactions(path string) error {
 	prefix := compactionPrefix(path)
 	removed := false
 	for _, entry := range entries {
-		if !entry.Type().IsRegular() || len(entry.Name()) < len(prefix) || entry.Name()[:len(prefix)] != prefix {
+		if !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {

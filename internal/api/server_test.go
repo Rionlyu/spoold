@@ -94,6 +94,42 @@ func TestRejectsUnknownJSONField(t *testing.T) {
 	}
 }
 
+func TestStatusRecorderKeepsFirstResponseStatus(t *testing.T) {
+	response := httptest.NewRecorder()
+	recorder := &statusRecorder{
+		ResponseWriter: response,
+		status:         http.StatusOK,
+	}
+	recorder.WriteHeader(http.StatusCreated)
+	recorder.WriteHeader(http.StatusInternalServerError)
+
+	if recorder.status != http.StatusCreated {
+		t.Fatalf("recorded status = %d, want %d", recorder.status, http.StatusCreated)
+	}
+	if response.Code != http.StatusCreated {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusCreated)
+	}
+}
+
+func TestStatusRecorderCapturesImplicitOKStatus(t *testing.T) {
+	response := httptest.NewRecorder()
+	recorder := &statusRecorder{
+		ResponseWriter: response,
+		status:         http.StatusOK,
+	}
+	if _, err := recorder.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	recorder.WriteHeader(http.StatusInternalServerError)
+
+	if recorder.status != http.StatusOK {
+		t.Fatalf("recorded status = %d, want %d", recorder.status, http.StatusOK)
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusOK)
+	}
+}
+
 func TestMetricsExposeDeliveryAndJournalHealth(t *testing.T) {
 	server, journal := newTestServer(t)
 	request(t, server, http.MethodPost, "/v1/deliveries", `{"targetUrl":"https://example.com"}`)

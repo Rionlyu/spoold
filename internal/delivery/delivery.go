@@ -78,14 +78,6 @@ func New(req CreateRequest, now time.Time) (Delivery, string, error) {
 	}, hash, nil
 }
 
-func Fingerprint(req CreateRequest) (string, error) {
-	normalized, err := normalize(req)
-	if err != nil {
-		return "", err
-	}
-	return fingerprint(normalized), nil
-}
-
 func Clone(d Delivery) Delivery {
 	d.Headers = cloneHeaders(d.Headers)
 	d.Body = append(json.RawMessage(nil), d.Body...)
