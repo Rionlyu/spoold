@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -76,6 +77,186 @@ func TestIdempotencyKeyRejectsDifferentRequest(t *testing.T) {
 	base.TargetURL = "https://example.com/b"
 	if _, _, err := store.Create(base, now); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("Create() error = %v, want %v", err, ErrIdempotencyConflict)
+	}
+}
+
+func TestOpenRejectsConcurrentJournalOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, ErrJournalLocked) {
+		t.Fatalf("second Open() error = %v, want %v", err, ErrJournalLocked)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() after owner closed: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJournalAdmissionLimitRejectsOnlyNewDeliveries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	request := delivery.CreateRequest{
+		IdempotencyKey: "first",
+		TargetURL:      "https://example.com/first",
+	}
+	now := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+
+	initial, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := initial.Create(request, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bounded, err := Open(path, Options{MaxJournalBytes: info.Size()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bounded.Close() })
+	duplicate, created, err := bounded.Create(request, now.Add(time.Minute))
+	if err != nil || created || duplicate.ID != first.ID {
+		t.Fatalf("idempotent Create() = (%q, %v, %v)", duplicate.ID, created, err)
+	}
+	if _, _, err := bounded.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/second",
+	}, now); !errors.Is(err, ErrJournalFull) {
+		t.Fatalf("new Create() error = %v, want %v", err, ErrJournalFull)
+	}
+	if claimed, err := bounded.ClaimDue(now, time.Minute, 1); err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimDue() = %#v, %v", claimed, err)
+	}
+	if got := bounded.Stats().MaxJournalBytes; got != info.Size() {
+		t.Fatalf("maximum journal bytes = %d, want %d", got, info.Size())
+	}
+}
+
+func TestPersistenceFailureMarksStoreUnreadyUntilCompactionRepairsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	original := store.file
+	readOnly, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.file = readOnly
+	if _, _, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/fails",
+	}, time.Now()); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Create() error = %v, want %v", err, ErrPersistence)
+	}
+	if err := store.Ready(); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Ready() error = %v, want %v", err, ErrPersistence)
+	}
+
+	if err := store.Compact(); err != nil {
+		t.Fatalf("repairing Compact(): %v", err)
+	}
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ready(); err != nil {
+		t.Fatalf("Ready() after compaction: %v", err)
+	}
+	if _, created, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/works",
+	}, time.Now()); err != nil || !created {
+		t.Fatalf("Create() after repair = (%v, %v)", created, err)
+	}
+}
+
+func TestPruneTerminalRemovesStateAndIdempotencyKeysAcrossReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+
+	succeeded := createTestDelivery(t, store, "succeeded", now)
+	claimed, err := store.ClaimDue(now, time.Minute, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim succeeded = %#v, %v", claimed, err)
+	}
+	if err := store.Succeed(succeeded.ID, claimed[0].Attempts, 204, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := createTestDelivery(t, store, "failed", now.Add(time.Minute))
+	claimed, err = store.ClaimDue(now.Add(time.Minute), time.Minute, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim failed = %#v, %v", claimed, err)
+	}
+	if err := store.Fail(failed.ID, claimed[0].Attempts, 503, "failed", time.Time{}, true, now.Add(time.Minute+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled := createTestDelivery(t, store, "canceled", now.Add(2*time.Minute))
+	if _, err := store.Cancel(canceled.ID, now.Add(2*time.Minute+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	pending := createTestDelivery(t, store, "pending", now.Add(3*time.Minute))
+
+	pruned, err := store.PruneTerminal(now.Add(10 * time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 3 {
+		t.Fatalf("pruned deliveries = %d, want 3", pruned)
+	}
+	for _, id := range []string{succeeded.ID, failed.ID, canceled.ID} {
+		if _, err := store.Get(id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get(%q) error = %v, want %v", id, err, ErrNotFound)
+		}
+	}
+	if _, err := store.Get(pending.ID); err != nil {
+		t.Fatalf("pending delivery was pruned: %v", err)
+	}
+
+	replacement, created, err := store.Create(delivery.CreateRequest{
+		IdempotencyKey: "succeeded",
+		TargetURL:      "https://example.com/succeeded",
+	}, now.Add(time.Hour))
+	if err != nil || !created || replacement.ID == succeeded.ID {
+		t.Fatalf("replacement Create() = (%q, %v, %v)", replacement.ID, created, err)
+	}
+	if got := store.Stats().PrunedDeliveries; got != 3 {
+		t.Fatalf("pruned delivery metric = %d, want 3", got)
+	}
+
+	before := store.List("")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	if got := reopened.List(""); !reflect.DeepEqual(got, before) {
+		t.Fatalf("replayed state differs:\ngot  %#v\nwant %#v", got, before)
 	}
 }
 
@@ -181,6 +362,41 @@ func TestReplayAcceptsCompleteFinalRecordWithoutNewline(t *testing.T) {
 	t.Cleanup(func() { reopened.Close() })
 	if _, err := reopened.Get(item.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBinaryBodySurvivesCompactionAndReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x00, 0xff, 0x10}
+	item, _, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/upload",
+		Body:      want,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	got, err := reopened.Get(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Body, want) {
+		t.Fatalf("body = %v, want %v", got.Body, want)
 	}
 }
 
@@ -304,44 +520,67 @@ func TestCompactFailureBeforeRenameLeavesOriginalJournalWritable(t *testing.T) {
 	assertReplaysIDs(t, path, first.ID, second.ID)
 }
 
-func TestCompactFailureAfterReplacementKeepsSubsequentAppendsRecoverable(t *testing.T) {
-	for _, failureStage := range []compactionStage{compactionAfterRename, compactionAfterDirSync} {
-		t.Run(string(failureStage), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "spoold.journal")
-			store, err := Open(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			first := createTestDelivery(t, store, "first", time.Now())
-			claimed, err := store.ClaimDue(time.Now().Add(time.Second), time.Minute, 1)
-			if err != nil || len(claimed) != 1 {
-				t.Fatalf("ClaimDue() = %#v, %v", claimed, err)
-			}
-			if err := store.Succeed(first.ID, claimed[0].Attempts, 200, time.Now().Add(2*time.Second)); err != nil {
-				t.Fatal(err)
-			}
-
-			store.compactionHook = func(stage compactionStage) error {
-				if stage == failureStage {
-					return errors.New("injected failure")
-				}
-				return nil
-			}
-			if err := store.Compact(); err == nil {
-				t.Fatal("Compact() error = nil, want injected failure")
-			}
-			store.compactionHook = nil
-			second := createTestDelivery(t, store, "second", time.Now().Add(3*time.Second))
-			stats := store.Stats()
-			if stats.CompactionsFailed != 1 || stats.CompactionsSucceeded != 0 || stats.JournalRecords != 2 {
-				t.Fatalf("stats = %#v", stats)
-			}
-			if err := store.Close(); err != nil {
-				t.Fatal(err)
-			}
-			assertReplaysIDs(t, path, first.ID, second.ID)
-		})
+func TestCompactFailureAfterRenameRequiresDurabilityRepair(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, first := storeWithTransitionedDelivery(t, path)
+	store.compactionHook = func(stage compactionStage) error {
+		if stage == compactionAfterRename {
+			return errors.New("injected failure")
+		}
+		return nil
 	}
+	if err := store.Compact(); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Compact() error = %v, want %v", err, ErrPersistence)
+	}
+	if err := store.Ready(); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Ready() error = %v, want %v", err, ErrPersistence)
+	}
+	if _, _, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/blocked",
+	}, time.Now()); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("Create() before repair error = %v, want %v", err, ErrPersistence)
+	}
+
+	store.compactionHook = nil
+	if err := store.Compact(); err != nil {
+		t.Fatalf("repairing Compact(): %v", err)
+	}
+	second := createTestDelivery(t, store, "second", time.Now().Add(3*time.Second))
+	stats := store.Stats()
+	if stats.CompactionsFailed != 1 || stats.CompactionsSucceeded != 1 || stats.JournalRecords != 2 {
+		t.Fatalf("stats = %#v", stats)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertReplaysIDs(t, path, first.ID, second.ID)
+}
+
+func TestCompactFailureAfterDirectorySyncKeepsSubsequentAppendsRecoverable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, first := storeWithTransitionedDelivery(t, path)
+	store.compactionHook = func(stage compactionStage) error {
+		if stage == compactionAfterDirSync {
+			return errors.New("injected failure")
+		}
+		return nil
+	}
+	if err := store.Compact(); err == nil {
+		t.Fatal("Compact() error = nil, want injected failure")
+	}
+	if err := store.Ready(); err != nil {
+		t.Fatalf("Ready() after durable replacement = %v", err)
+	}
+	store.compactionHook = nil
+	second := createTestDelivery(t, store, "second", time.Now().Add(3*time.Second))
+	stats := store.Stats()
+	if stats.CompactionsFailed != 1 || stats.CompactionsSucceeded != 0 || stats.JournalRecords != 2 {
+		t.Fatalf("stats = %#v", stats)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertReplaysIDs(t, path, first.ID, second.ID)
 }
 
 func TestOpenRemovesAbandonedCompactionFiles(t *testing.T) {
@@ -452,6 +691,23 @@ func createTestDelivery(t *testing.T, store *Store, key string, now time.Time) d
 		t.Fatal(err)
 	}
 	return item
+}
+
+func storeWithTransitionedDelivery(t *testing.T, path string) (*Store, delivery.Delivery) {
+	t.Helper()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := createTestDelivery(t, store, "first", time.Now())
+	claimed, err := store.ClaimDue(time.Now().Add(time.Second), time.Minute, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimDue() = %#v, %v", claimed, err)
+	}
+	if err := store.Succeed(first.ID, claimed[0].Attempts, 200, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	return store, first
 }
 
 func assertJournalIDsSorted(t *testing.T, path string) {

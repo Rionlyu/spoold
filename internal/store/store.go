@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,25 +23,38 @@ var (
 	ErrInvalidTransition   = errors.New("invalid delivery state transition")
 	ErrStaleLease          = errors.New("delivery lease is no longer current")
 	ErrPersistence         = errors.New("delivery persistence failed")
+	ErrJournalFull         = errors.New("journal admission limit reached")
+	ErrJournalLocked       = errors.New("journal is already owned by another spoold process")
 )
+
+const currentJournalVersion = 2
+
+type Options struct {
+	MaxJournalBytes int64
+}
 
 type Store struct {
 	mu                   sync.Mutex
 	path                 string
 	file                 *os.File
+	lock                 *os.File
 	items                map[string]delivery.Delivery
 	hashes               map[string]string
 	keyToID              map[string]string
+	maxJournalBytes      int64
+	persistenceErr       error
 	records              uint64
+	prunedDeliveries     uint64
 	compactionsSucceeded uint64
 	compactionsFailed    uint64
 	compactionHook       func(compactionStage) error
 }
 
 type journalRecord struct {
-	Version     int               `json:"version"`
-	Delivery    delivery.Delivery `json:"delivery"`
-	RequestHash string            `json:"requestHash,omitempty"`
+	Version     int                `json:"version"`
+	Delivery    *delivery.Delivery `json:"delivery,omitempty"`
+	RequestHash string             `json:"requestHash,omitempty"`
+	DeletedID   string             `json:"deletedId,omitempty"`
 }
 
 type Counts map[delivery.Status]int
@@ -49,6 +63,8 @@ type Stats struct {
 	JournalSizeBytes     int64
 	JournalRecords       uint64
 	LiveDeliveries       uint64
+	MaxJournalBytes      int64
+	PrunedDeliveries     uint64
 	CompactionsSucceeded uint64
 	CompactionsFailed    uint64
 }
@@ -61,38 +77,84 @@ const (
 	compactionAfterDirSync compactionStage = "after_directory_sync"
 )
 
-func Open(path string) (*Store, error) {
+func Open(path string, options ...Options) (*Store, error) {
+	if len(options) > 1 {
+		return nil, errors.New("only one store options value is supported")
+	}
+	cfg := Options{}
+	if len(options) == 1 {
+		cfg = options[0]
+	}
+	if cfg.MaxJournalBytes < 0 {
+		return nil, errors.New("maximum journal size must not be negative")
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create journal directory: %w", err)
 	}
+
+	lock, err := acquireJournalLock(path)
+	if err != nil {
+		return nil, err
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			_ = releaseJournalLock(lock)
+		}
+	}()
+
 	if err := removeAbandonedCompactions(path); err != nil {
 		return nil, err
+	}
+
+	_, statErr := os.Stat(path)
+	newJournal := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !newJournal {
+		return nil, fmt.Errorf("stat journal: %w", statErr)
 	}
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open journal: %w", err)
 	}
+	if newJournal {
+		if err := syncDirectory(dir); err != nil {
+			file.Close()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("persist new journal: %w", err)
+		}
+	}
 
 	store := &Store{
-		path:    path,
-		file:    file,
-		items:   make(map[string]delivery.Delivery),
-		hashes:  make(map[string]string),
-		keyToID: make(map[string]string),
+		path:            path,
+		file:            file,
+		lock:            lock,
+		items:           make(map[string]delivery.Delivery),
+		hashes:          make(map[string]string),
+		keyToID:         make(map[string]string),
+		maxJournalBytes: cfg.MaxJournalBytes,
 	}
 	if err := store.replay(); err != nil {
 		file.Close()
 		return nil, err
 	}
+	releaseLock = false
 	return store, nil
 }
 
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.file.Close()
+
+	var fileErr error
+	if s.file != nil {
+		fileErr = s.file.Close()
+		s.file = nil
+	}
+	lockErr := releaseJournalLock(s.lock)
+	s.lock = nil
+	return errors.Join(fileErr, lockErr)
 }
 
 func (s *Store) Create(req delivery.CreateRequest, now time.Time) (delivery.Delivery, bool, error) {
@@ -113,8 +175,11 @@ func (s *Store) Create(req delivery.CreateRequest, now time.Time) (delivery.Deli
 		}
 	}
 
+	if err := s.checkAdmissionLocked(candidate, requestHash); err != nil {
+		return delivery.Delivery{}, false, err
+	}
 	if err := s.appendLocked(candidate, requestHash); err != nil {
-		return delivery.Delivery{}, false, fmt.Errorf("%w: %v", ErrPersistence, err)
+		return delivery.Delivery{}, false, err
 	}
 	s.setLocked(candidate, requestHash)
 	return delivery.Clone(candidate), true, nil
@@ -151,6 +216,15 @@ func (s *Store) List(status delivery.Status) []delivery.Delivery {
 }
 
 func (s *Store) ClaimDue(now time.Time, leaseDuration time.Duration, limit int) ([]delivery.Delivery, error) {
+	return s.ClaimDueMatching(now, leaseDuration, limit, nil)
+}
+
+func (s *Store) ClaimDueMatching(
+	now time.Time,
+	leaseDuration time.Duration,
+	limit int,
+	eligible func(delivery.Delivery) bool,
+) ([]delivery.Delivery, error) {
 	if limit < 1 {
 		return nil, nil
 	}
@@ -162,7 +236,7 @@ func (s *Store) ClaimDue(now time.Time, leaseDuration time.Duration, limit int) 
 	for _, item := range s.items {
 		pending := item.Status == delivery.StatusPending && !item.NextAttemptAt.After(now)
 		expired := item.Status == delivery.StatusInFlight && !item.LeaseUntil.After(now)
-		if pending || expired {
+		if (pending || expired) && (eligible == nil || eligible(delivery.Clone(item))) {
 			candidates = append(candidates, item)
 		}
 	}
@@ -294,16 +368,70 @@ func (s *Store) Stats() Stats {
 	defer s.mu.Unlock()
 
 	var size int64
-	if info, err := s.file.Stat(); err == nil {
-		size = info.Size()
+	if s.file != nil {
+		if info, err := s.file.Stat(); err == nil {
+			size = info.Size()
+		}
 	}
 	return Stats{
 		JournalSizeBytes:     size,
 		JournalRecords:       s.records,
 		LiveDeliveries:       uint64(len(s.items)),
+		MaxJournalBytes:      s.maxJournalBytes,
+		PrunedDeliveries:     s.prunedDeliveries,
 		CompactionsSucceeded: s.compactionsSucceeded,
 		CompactionsFailed:    s.compactionsFailed,
 	}
+}
+
+func (s *Store) Ready() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.persistenceErr != nil {
+		return s.persistenceErr
+	}
+	if s.file == nil {
+		return errors.New("journal is closed")
+	}
+	if _, err := s.file.Stat(); err != nil {
+		return fmt.Errorf("stat journal: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PruneTerminal(before time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]string, 0)
+	for id, item := range s.items {
+		terminal := item.Status == delivery.StatusSucceeded ||
+			item.Status == delivery.StatusFailed ||
+			item.Status == delivery.StatusCanceled
+		if terminal && !item.UpdatedAt.After(before) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	sort.Strings(ids)
+
+	var records bytes.Buffer
+	for _, id := range ids {
+		if err := writeDeleteRecord(&records, id); err != nil {
+			return 0, err
+		}
+	}
+	if err := s.appendDataLocked(records.Bytes(), uint64(len(ids))); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		s.deleteLocked(id)
+	}
+	s.prunedDeliveries += uint64(len(ids))
+	return len(ids), nil
 }
 
 func (s *Store) Compact() (err error) {
@@ -315,6 +443,9 @@ func (s *Store) Compact() (err error) {
 			s.compactionsFailed++
 		}
 	}()
+	if s.file == nil {
+		return errors.New("compact closed journal")
+	}
 
 	temp, err := os.CreateTemp(filepath.Dir(s.path), compactionPrefix(s.path))
 	if err != nil {
@@ -360,26 +491,35 @@ func (s *Store) Compact() (err error) {
 	}
 	renamed = true
 	if err := s.runCompactionHook(compactionAfterRename); err != nil {
-		err = errors.Join(err, s.adoptCompactedLocked(temp, uint64(len(ids))))
+		err = s.failPersistenceLocked(errors.Join(
+			err,
+			s.adoptCompactedLocked(temp, uint64(len(ids))),
+		))
 		adopted = true
 		return err
 	}
 	if err := syncDirectory(filepath.Dir(s.path)); err != nil {
-		err = errors.Join(err, s.adoptCompactedLocked(temp, uint64(len(ids))))
+		err = s.failPersistenceLocked(errors.Join(
+			err,
+			s.adoptCompactedLocked(temp, uint64(len(ids))),
+		))
 		adopted = true
 		return err
 	}
 	if err := s.runCompactionHook(compactionAfterDirSync); err != nil {
 		err = errors.Join(err, s.adoptCompactedLocked(temp, uint64(len(ids))))
 		adopted = true
+		s.persistenceErr = nil
 		return err
 	}
 
 	if err := s.adoptCompactedLocked(temp, uint64(len(ids))); err != nil {
 		adopted = true
+		s.persistenceErr = nil
 		return err
 	}
 	adopted = true
+	s.persistenceErr = nil
 	s.compactionsSucceeded++
 	return nil
 }
@@ -411,25 +551,74 @@ func (s *Store) setLocked(item delivery.Delivery, requestHash string) {
 	}
 }
 
+func (s *Store) deleteLocked(id string) {
+	item, ok := s.items[id]
+	if !ok {
+		return
+	}
+	delete(s.items, id)
+	delete(s.hashes, id)
+	if item.IdempotencyKey != "" && s.keyToID[item.IdempotencyKey] == id {
+		delete(s.keyToID, item.IdempotencyKey)
+	}
+}
+
 func (s *Store) appendLocked(item delivery.Delivery, requestHash string) error {
-	if err := writeRecord(s.file, item, requestHash); err != nil {
+	data, err := marshalRecord(item, requestHash)
+	if err != nil {
 		return err
 	}
-	if err := s.file.Sync(); err != nil {
-		return fmt.Errorf("sync journal: %w", err)
+	return s.appendDataLocked(data, 1)
+}
+
+func (s *Store) appendDataLocked(data []byte, records uint64) error {
+	if s.persistenceErr != nil {
+		return s.persistenceErr
 	}
-	s.records++
+	if s.file == nil {
+		return s.failPersistenceLocked(errors.New("journal is closed"))
+	}
+	if _, err := s.file.Write(data); err != nil {
+		return s.failPersistenceLocked(fmt.Errorf("append journal record: %w", err))
+	}
+	if err := s.file.Sync(); err != nil {
+		return s.failPersistenceLocked(fmt.Errorf("sync journal: %w", err))
+	}
+	s.records += records
 	return nil
 }
 
 func writeRecord(writer io.Writer, item delivery.Delivery, requestHash string) error {
+	data, err := marshalRecord(item, requestHash)
+	if err != nil {
+		return err
+	}
+	if _, err := writer.Write(data); err != nil {
+		return fmt.Errorf("append journal record: %w", err)
+	}
+	return nil
+}
+
+func marshalRecord(item delivery.Delivery, requestHash string) ([]byte, error) {
 	data, err := json.Marshal(journalRecord{
-		Version:     1,
-		Delivery:    item,
+		Version:     currentJournalVersion,
+		Delivery:    &item,
 		RequestHash: requestHash,
 	})
 	if err != nil {
-		return fmt.Errorf("encode journal record: %w", err)
+		return nil, fmt.Errorf("encode journal record: %w", err)
+	}
+	data = append(data, '\n')
+	return data, nil
+}
+
+func writeDeleteRecord(writer io.Writer, id string) error {
+	data, err := json.Marshal(journalRecord{
+		Version:   currentJournalVersion,
+		DeletedID: id,
+	})
+	if err != nil {
+		return fmt.Errorf("encode journal deletion: %w", err)
 	}
 	data = append(data, '\n')
 	if _, err := writer.Write(data); err != nil {
@@ -482,14 +671,49 @@ func (s *Store) replay() error {
 }
 
 func (s *Store) applyRecord(record journalRecord, line int) error {
-	if record.Version != 1 {
+	if record.Version != 1 && record.Version != currentJournalVersion {
 		return fmt.Errorf("journal line %d uses unsupported version %d", line, record.Version)
 	}
-	if record.Delivery.ID == "" {
+	if record.DeletedID != "" {
+		if record.Version < 2 {
+			return fmt.Errorf("journal line %d uses a deletion with version %d", line, record.Version)
+		}
+		if record.Delivery != nil {
+			return fmt.Errorf("journal line %d contains both a delivery and deletion", line)
+		}
+		s.deleteLocked(record.DeletedID)
+		return nil
+	}
+	if record.Delivery == nil || record.Delivery.ID == "" {
 		return fmt.Errorf("journal line %d has no delivery id", line)
 	}
-	s.setLocked(record.Delivery, record.RequestHash)
+	s.setLocked(*record.Delivery, record.RequestHash)
 	return nil
+}
+
+func (s *Store) checkAdmissionLocked(item delivery.Delivery, requestHash string) error {
+	if s.maxJournalBytes == 0 {
+		return nil
+	}
+	data, err := marshalRecord(item, requestHash)
+	if err != nil {
+		return err
+	}
+	info, err := s.file.Stat()
+	if err != nil {
+		return s.failPersistenceLocked(fmt.Errorf("stat journal: %w", err))
+	}
+	if info.Size()+int64(len(data)) > s.maxJournalBytes {
+		return ErrJournalFull
+	}
+	return nil
+}
+
+func (s *Store) failPersistenceLocked(err error) error {
+	if s.persistenceErr == nil {
+		s.persistenceErr = fmt.Errorf("%w: %w", ErrPersistence, err)
+	}
+	return s.persistenceErr
 }
 
 func (s *Store) adoptCompactedLocked(file *os.File, records uint64) error {

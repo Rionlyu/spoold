@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -112,6 +114,73 @@ func TestSendReadsBodyFromStdin(t *testing.T) {
 	}
 	if got := string(journal.List("")[0].Body); got != `{"offline":true}` {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestSendReadsArbitraryBinaryBody(t *testing.T) {
+	server, journal := newSpooldServer(t)
+	bodyPath := filepath.Join(t.TempDir(), "payload.bin")
+	want := []byte{0x00, 0xff, 0x10}
+	if err := os.WriteFile(bodyPath, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{
+		"send",
+		"--server", server.URL,
+		"--data-binary", bodyPath,
+		"--header", "Content-Type: application/octet-stream",
+		"https://example.com/upload",
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	items := journal.List("")
+	if len(items) != 1 || !bytes.Equal(items[0].Body, want) {
+		t.Fatalf("deliveries = %#v", items)
+	}
+}
+
+func TestListConnectsThroughUnixSocket(t *testing.T) {
+	socketDir, err := os.MkdirTemp("/tmp", "spoolctl-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(socketDir) })
+	socketPath := filepath.Join(socketDir, "spoold.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := store.Open(filepath.Join(t.TempDir(), "journal"))
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	httpServer := &http.Server{Handler: api.New(journal, nil, logger)}
+	go httpServer.Serve(listener)
+	t.Cleanup(func() {
+		httpServer.Close()
+		journal.Close()
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{
+		"list",
+		"--server", "unix://" + socketPath,
+		"--json",
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	var response listResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("decode stdout: %v", err)
+	}
+	if response.Count != 0 {
+		t.Fatalf("count = %d, want 0", response.Count)
 	}
 }
 
@@ -235,6 +304,7 @@ func TestCommandUsageExitCodes(t *testing.T) {
 	}{
 		{name: "no command", code: 2, text: "Usage:"},
 		{name: "help", args: []string{"help"}, code: 0, text: "crash-safe HTTP deliveries"},
+		{name: "version", args: []string{"version"}, code: 0, text: "spoolctl dev"},
 		{name: "unknown", args: []string{"unknown"}, code: 2, text: "unknown command"},
 		{name: "send missing URL", args: []string{"send"}, code: 2, text: "requires exactly one target URL"},
 		{name: "list extra argument", args: []string{"list", "extra"}, code: 2, text: "does not accept"},
@@ -266,9 +336,14 @@ func TestSendValidatesClientOptions(t *testing.T) {
 			text: "cannot be used together",
 		},
 		{
+			name: "JSON and binary body sources",
+			args: []string{"send", "--data", "{}", "--data-binary", "-", "https://example.com"},
+			text: "cannot be used together",
+		},
+		{
 			name: "invalid server",
-			args: []string{"send", "--server", "unix:///tmp/spoold.sock", "https://example.com"},
-			text: "must use http or https",
+			args: []string{"send", "--server", "smtp://localhost", "https://example.com"},
+			text: "must use http, https, or unix",
 		},
 		{
 			name: "invalid header",

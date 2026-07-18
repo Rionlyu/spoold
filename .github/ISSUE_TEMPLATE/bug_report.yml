@@ -1,0 +1,44 @@
+name: Bug report
+description: Report incorrect delivery, persistence, installation, or operational behavior
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not include secrets, authorization headers, or sensitive payloads.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output from `spoold -version` and `spoolctl version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, architecture, and installation method.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include expected behavior and a minimal reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant sanitized logs
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed secrets and sensitive payload data.
+          required: true
+        - label: I searched existing issues for this problem.
+          required: true

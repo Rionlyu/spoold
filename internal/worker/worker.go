@@ -3,11 +3,14 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +27,7 @@ type Config struct {
 	LeaseDuration time.Duration
 	BaseBackoff   time.Duration
 	MaxBackoff    time.Duration
+	PerTarget     int
 }
 
 type Metrics struct {
@@ -43,6 +47,8 @@ type Pool struct {
 	succeeded        atomic.Uint64
 	retryableFailure atomic.Uint64
 	terminalFailure  atomic.Uint64
+	claimMu          sync.Mutex
+	activeTargets    map[string]int
 	wg               sync.WaitGroup
 }
 
@@ -62,11 +68,15 @@ func New(store *store.Store, client *http.Client, logger *slog.Logger, config Co
 	if config.MaxBackoff <= 0 {
 		config.MaxBackoff = 5 * time.Minute
 	}
+	if config.PerTarget < 1 {
+		config.PerTarget = 1
+	}
 	return &Pool{
-		store:  store,
-		client: client,
-		log:    logger,
-		config: config,
+		store:         store,
+		client:        client,
+		log:           logger,
+		config:        config,
+		activeTargets: make(map[string]int),
 	}
 }
 
@@ -102,16 +112,42 @@ func (p *Pool) run(ctx context.Context) {
 		case <-timer.C:
 		}
 
-		claimed, err := p.store.ClaimDue(time.Now(), p.config.LeaseDuration, 1)
+		claimed, err := p.claimDue(time.Now())
 		if err != nil {
 			p.log.Error("claim delivery", "error", err)
 		} else if len(claimed) == 1 {
 			p.deliver(ctx, claimed[0])
+			p.releaseTarget(claimed[0])
 			timer.Reset(0)
 			continue
 		}
 		timer.Reset(p.config.PollInterval)
 	}
+}
+
+func (p *Pool) claimDue(now time.Time) ([]delivery.Delivery, error) {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+
+	claimed, err := p.store.ClaimDueMatching(now, p.config.LeaseDuration, 1, func(item delivery.Delivery) bool {
+		return p.activeTargets[targetKey(item.TargetURL)] < p.config.PerTarget
+	})
+	if err == nil && len(claimed) == 1 {
+		p.activeTargets[targetKey(claimed[0].TargetURL)]++
+	}
+	return claimed, err
+}
+
+func (p *Pool) releaseTarget(item delivery.Delivery) {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+
+	key := targetKey(item.TargetURL)
+	if p.activeTargets[key] <= 1 {
+		delete(p.activeTargets, key)
+		return
+	}
+	p.activeTargets[key]--
 }
 
 func (p *Pool) deliver(ctx context.Context, item delivery.Delivery) {
@@ -158,7 +194,11 @@ func (p *Pool) send(ctx context.Context, item delivery.Delivery) (int, error) {
 		request.Header.Set(name, value)
 	}
 	if len(item.Body) > 0 && request.Header.Get("Content-Type") == "" {
-		request.Header.Set("Content-Type", "application/json")
+		contentType := "application/octet-stream"
+		if json.Valid(item.Body) {
+			contentType = "application/json"
+		}
+		request.Header.Set("Content-Type", contentType)
 	}
 	request.Header.Set("X-Spoold-Delivery-ID", item.ID)
 	request.Header.Set("X-Spoold-Attempt", strconv.Itoa(item.Attempts))
@@ -220,4 +260,22 @@ func failureMessage(status int, err error) string {
 		return err.Error()
 	}
 	return fmt.Sprintf("HTTP %d", status)
+}
+
+func targetKey(targetURL string) string {
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		return strings.ToLower(targetURL)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	port := parsed.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(parsed.Hostname()), port)
 }

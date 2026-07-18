@@ -128,11 +128,116 @@ func TestPoolDoesNotRetryClientError(t *testing.T) {
 	t.Fatal("delivery did not fail before timeout")
 }
 
+func TestPoolDoesNotLetOneTargetConsumeAllWorkers(t *testing.T) {
+	blocked := make(chan struct{})
+	firstTargetStarted := make(chan struct{}, 1)
+	firstTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case firstTargetStarted <- struct{}{}:
+		default:
+		}
+		<-blocked
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer firstTarget.Close()
+
+	secondTargetCalled := make(chan struct{}, 1)
+	secondTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondTargetCalled <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer secondTarget.Close()
+
+	journal, err := store.Open(filepath.Join(t.TempDir(), "journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	now := time.Now()
+	for index, targetURL := range []string{firstTarget.URL, firstTarget.URL, secondTarget.URL} {
+		if _, _, err := journal.Create(delivery.CreateRequest{
+			TargetURL: targetURL,
+		}, now.Add(time.Duration(index)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pool := New(journal, target.NewClient(true, time.Second), slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		Concurrency:  2,
+		PerTarget:    1,
+		PollInterval: time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	pool.Start(ctx)
+	defer func() {
+		close(blocked)
+		cancel()
+		pool.Wait()
+	}()
+
+	select {
+	case <-firstTargetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first target was not called")
+	}
+	select {
+	case <-secondTargetCalled:
+	case <-time.After(time.Second):
+		t.Fatal("second target was starved by the first target")
+	}
+}
+
+func TestSendDefaultsBinaryBodyContentType(t *testing.T) {
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Type"); got != "application/octet-stream" {
+			t.Errorf("Content-Type = %q, want application/octet-stream", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		if string(body) != "\x00\xff" {
+			t.Errorf("body = %v", body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+
+	pool := New(nil, target.NewClient(true, time.Second), slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+	status, err := pool.send(context.Background(), delivery.Delivery{
+		ID:        "binary",
+		TargetURL: destination.URL,
+		Method:    http.MethodPost,
+		Body:      []byte{0x00, 0xff},
+		Attempts:  1,
+	})
+	if err != nil || status != http.StatusNoContent {
+		t.Fatalf("send() = (%d, %v)", status, err)
+	}
+}
+
 func TestBackoffIsBounded(t *testing.T) {
 	for attempt := 1; attempt <= 20; attempt++ {
 		got := Backoff(time.Second, 10*time.Second, "delivery", attempt)
 		if got <= 0 || got > 10*time.Second {
 			t.Fatalf("Backoff(attempt=%d) = %s", attempt, got)
+		}
+	}
+}
+
+func TestTargetKeyNormalizesEquivalentOrigins(t *testing.T) {
+	tests := []struct {
+		target string
+		want   string
+	}{
+		{target: "https://EXAMPLE.com/path", want: "https://example.com:443"},
+		{target: "https://example.com:443/other", want: "https://example.com:443"},
+		{target: "http://example.com", want: "http://example.com:80"},
+		{target: "http://[2001:db8::1]/events", want: "http://[2001:db8::1]:80"},
+	}
+	for _, test := range tests {
+		if got := targetKey(test.target); got != test.want {
+			t.Errorf("targetKey(%q) = %q, want %q", test.target, got, test.want)
 		}
 	}
 }

@@ -147,17 +147,76 @@ func TestCompactionFailureIsNonFatal(t *testing.T) {
 	compactor.Wait()
 }
 
+func TestMaintenanceRepairsUnreadyJournalBelowThreshold(t *testing.T) {
+	journal := &fakeStore{
+		stats: store.Stats{
+			JournalSizeBytes: 10,
+			JournalRecords:   1,
+			LiveDeliveries:   1,
+		},
+		readyErr: errors.New("injected persistence failure"),
+	}
+	compactor := New(journal, discardLogger(), Config{
+		ThresholdBytes: 100,
+	})
+
+	compactor.maintain()
+
+	if got := journal.compactCalls(); got != 1 {
+		t.Fatalf("Compact() calls = %d, want 1", got)
+	}
+	if err := journal.Ready(); err != nil {
+		t.Fatalf("Ready() after repair = %v, want nil", err)
+	}
+}
+
+func TestRetentionPrunesTerminalDeliveriesAndCompactsTombstones(t *testing.T) {
+	now := time.Now()
+	journal := &fakeStore{
+		stats: store.Stats{
+			JournalSizeBytes: 100,
+			JournalRecords:   2,
+			LiveDeliveries:   2,
+		},
+		items: []time.Time{
+			now.Add(-2 * time.Hour),
+			now.Add(-30 * time.Minute),
+		},
+	}
+	compactor := New(journal, discardLogger(), Config{
+		ThresholdBytes: 0,
+		Retention:      time.Hour,
+	})
+	compactor.maintain()
+
+	if got := journal.compactCalls(); got != 1 {
+		t.Fatalf("Compact() calls = %d, want 1", got)
+	}
+	stats := journal.Stats()
+	if stats.LiveDeliveries != 1 || stats.JournalRecords != 1 || stats.PrunedDeliveries != 1 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
+
 type fakeStore struct {
 	mu       sync.Mutex
 	stats    store.Stats
 	calls    int
 	failures int
+	items    []time.Time
+	readyErr error
 }
 
 func (s *fakeStore) Stats() store.Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stats
+}
+
+func (s *fakeStore) Ready() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyErr
 }
 
 func (s *fakeStore) Compact() error {
@@ -172,6 +231,7 @@ func (s *fakeStore) Compact() error {
 	s.stats.JournalSizeBytes /= 2
 	s.stats.JournalRecords = s.stats.LiveDeliveries
 	s.stats.CompactionsSucceeded++
+	s.readyErr = nil
 	return nil
 }
 
@@ -179,6 +239,26 @@ func (s *fakeStore) compactCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+func (s *fakeStore) PruneTerminal(before time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	kept := s.items[:0]
+	pruned := 0
+	for _, updatedAt := range s.items {
+		if updatedAt.After(before) {
+			kept = append(kept, updatedAt)
+		} else {
+			pruned++
+		}
+	}
+	s.items = kept
+	s.stats.LiveDeliveries -= uint64(pruned)
+	s.stats.JournalRecords += uint64(pruned)
+	s.stats.PrunedDeliveries += uint64(pruned)
+	return pruned, nil
 }
 
 func waitForCompactions(t *testing.T, store *fakeStore, count int) {

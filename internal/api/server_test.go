@@ -65,6 +65,37 @@ func TestConflictingIdempotencyKeyReturnsConflict(t *testing.T) {
 	}
 }
 
+func TestCreateAcceptsBase64Body(t *testing.T) {
+	server, journal := newTestServer(t)
+	got := request(t, server, http.MethodPost, "/v1/deliveries", `{
+		"targetUrl":"https://example.com/upload",
+		"bodyBase64":"AP8Q"
+	}`)
+	if got.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+	}
+	items := journal.List("")
+	if len(items) != 1 || !bytes.Equal(items[0].Body, []byte{0x00, 0xff, 0x10}) {
+		t.Fatalf("deliveries = %#v", items)
+	}
+	if !strings.Contains(got.Body.String(), `"bodyBase64":"AP8Q"`) {
+		t.Fatalf("response body = %s", got.Body.String())
+	}
+}
+
+func TestCreateRejectsAmbiguousOrInvalidBase64Body(t *testing.T) {
+	server, _ := newTestServer(t)
+	for _, body := range []string{
+		`{"targetUrl":"https://example.com","body":{},"bodyBase64":"e30="}`,
+		`{"targetUrl":"https://example.com","bodyBase64":"not base64"}`,
+	} {
+		got := request(t, server, http.MethodPost, "/v1/deliveries", body)
+		if got.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+		}
+	}
+}
+
 func TestCancelDeliveryAndFilterList(t *testing.T) {
 	server, _ := newTestServer(t)
 	created := request(t, server, http.MethodPost, "/v1/deliveries", `{"targetUrl":"https://example.com"}`)
@@ -83,6 +114,32 @@ func TestCancelDeliveryAndFilterList(t *testing.T) {
 	}
 }
 
+func TestListOmitsPayloadWhileGetReturnsIt(t *testing.T) {
+	server, _ := newTestServer(t)
+	created := request(t, server, http.MethodPost, "/v1/deliveries", `{
+		"targetUrl":"https://example.com",
+		"headers":{"X-Secret":"value"},
+		"bodyBase64":"AP8Q"
+	}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var item delivery.Delivery
+	if err := json.Unmarshal(created.Body.Bytes(), &item); err != nil {
+		t.Fatal(err)
+	}
+
+	list := request(t, server, http.MethodGet, "/v1/deliveries", "")
+	if strings.Contains(list.Body.String(), "bodyBase64") || strings.Contains(list.Body.String(), "X-Secret") {
+		t.Fatalf("list exposed payload: %s", list.Body.String())
+	}
+	get := request(t, server, http.MethodGet, "/v1/deliveries/"+item.ID, "")
+	if !strings.Contains(get.Body.String(), `"bodyBase64":"AP8Q"`) ||
+		!strings.Contains(get.Body.String(), `"X-Secret":"value"`) {
+		t.Fatalf("get omitted payload: %s", get.Body.String())
+	}
+}
+
 func TestRejectsUnknownJSONField(t *testing.T) {
 	server, _ := newTestServer(t)
 	got := request(t, server, http.MethodPost, "/v1/deliveries", `{
@@ -91,6 +148,42 @@ func TestRejectsUnknownJSONField(t *testing.T) {
 	}`)
 	if got.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+	}
+}
+
+func TestReadinessReflectsJournalAvailability(t *testing.T) {
+	server, journal := newTestServer(t)
+	if got := request(t, server, http.MethodGet, "/readyz", ""); got.Code != http.StatusOK {
+		t.Fatalf("ready status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(t, server, http.MethodGet, "/healthz", ""); got.Code != http.StatusOK {
+		t.Fatalf("health status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if got := request(t, server, http.MethodGet, "/readyz", ""); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unready status = %d, body = %s", got.Code, got.Body.String())
+	}
+}
+
+func TestCreateReturnsInsufficientStorageAtAdmissionLimit(t *testing.T) {
+	journal, err := store.Open(filepath.Join(t.TempDir(), "journal"), store.Options{
+		MaxJournalBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { journal.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(journal, nil, logger)
+
+	got := request(t, server, http.MethodPost, "/v1/deliveries", `{"targetUrl":"https://example.com"}`)
+	if got.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), "journal_full") {
+		t.Fatalf("body = %s", got.Body.String())
 	}
 }
 
@@ -150,6 +243,8 @@ func TestMetricsExposeDeliveryAndJournalHealth(t *testing.T) {
 		`spoold_deliveries{status="in_flight"} 1`,
 		"spoold_journal_size_bytes " + strconv.FormatInt(stats.JournalSizeBytes, 10),
 		"spoold_journal_records 1",
+		"spoold_journal_max_bytes 0",
+		"spoold_journal_pruned_deliveries_total 0",
 		`spoold_journal_compactions_total{result="succeeded"} 1`,
 		`spoold_journal_compactions_total{result="failed"} 0`,
 	} {

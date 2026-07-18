@@ -12,9 +12,94 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: "1.26.x"
           cache: false
       - run: make verify
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.17.0
+          args: release --snapshot --clean --skip=sbom,sign
+      - name: Verify release archives
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          archive="$(find dist -maxdepth 1 -name '*_linux_amd64.tar.gz')"
+          tar -tzf "$archive" | grep -q '/spoold$'
+          tar -tzf "$archive" | grep -q '/spoolctl$'
+          (cd dist && sha256sum --check checksums.txt)
+          unpacked="$(mktemp -d)"
+          tar -xzf "$archive" -C "$unpacked"
+          "$(find "$unpacked" -type f -name spoold)" -version | grep -q 'spoold 0.0.0-SNAPSHOT'
+          "$(find "$unpacked" -type f -name spoolctl)" version | grep -q 'spoolctl 0.0.0-SNAPSHOT'
+      - name: Verify installer
+        run: |
+          installed="$(mktemp -d)"
+          version="$(jq -r .version dist/metadata.json)"
+          SPOOLD_INSTALL_DIR="$installed" \
+            SPOOLD_VERSION="$version" \
+            SPOOLD_RELEASE_BASE_URL="file://${GITHUB_WORKSPACE}/dist" \
+            sh scripts/install.sh
+          "$installed/spoold" -version | grep -q "spoold ${version}"
+          "$installed/spoolctl" version | grep -q "spoolctl ${version}"
+      - name: Verify release container
+        run: |
+          image="$(docker image ls ghcr.io/rionlyu/spoold --format '{{.Repository}}:{{.Tag}}' | grep -- '-amd64$' | head -n 1)"
+          test -n "$image"
+          docker run --rm "$image" -version | grep -q 'spoold 0.0.0-SNAPSHOT'
+          docker volume create spoold-ci-data
+          trap 'docker rm -f spoold-release-ci >/dev/null 2>&1 || true; docker volume rm spoold-ci-data >/dev/null 2>&1 || true' EXIT
+          docker run -d \
+            --name spoold-release-ci \
+            --publish 127.0.0.1:18080:8080 \
+            --volume spoold-ci-data:/var/lib/spoold \
+            "$image"
+          for _ in {1..50}; do
+            curl -fsS http://127.0.0.1:18080/readyz && break
+            sleep 0.1
+          done
+          response="$(curl -fsS \
+            --header 'Content-Type: application/json' \
+            --data '{"targetUrl":"http://127.0.0.1:1/events","body":{"container":"replay"}}' \
+            http://127.0.0.1:18080/v1/deliveries)"
+          id="$(jq -r .id <<<"$response")"
+          test -n "$id"
+          test "$id" != null
+          docker kill --signal KILL spoold-release-ci
+          docker rm spoold-release-ci
+          docker run -d \
+            --name spoold-release-ci \
+            --publish 127.0.0.1:18080:8080 \
+            --volume spoold-ci-data:/var/lib/spoold \
+            "$image"
+          for _ in {1..50}; do
+            curl -fsS http://127.0.0.1:18080/readyz && break
+            sleep 0.1
+          done
+          curl -fsS "http://127.0.0.1:18080/v1/deliveries/${id}" |
+            jq -e --arg id "$id" '.id == $id'
+      - name: Build container
+        run: |
+          docker build \
+            --build-arg VERSION=ci \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg DATE=1970-01-01T00:00:00Z \
+            --tag spoold:ci .
+          docker run --rm spoold:ci -version | grep -q 'spoold ci'
