@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -125,7 +126,7 @@ func TestJournalAdmissionLimitRejectsOnlyNewDeliveries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bounded, err := OpenWithOptions(path, Options{MaxJournalBytes: info.Size()})
+	bounded, err := Open(path, Options{MaxJournalBytes: info.Size()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,6 +362,41 @@ func TestReplayAcceptsCompleteFinalRecordWithoutNewline(t *testing.T) {
 	t.Cleanup(func() { reopened.Close() })
 	if _, err := reopened.Get(item.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBinaryBodySurvivesCompactionAndReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spoold.journal")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x00, 0xff, 0x10}
+	item, _, err := store.Create(delivery.CreateRequest{
+		TargetURL: "https://example.com/upload",
+		Body:      want,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	got, err := reopened.Get(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Body, want) {
+		t.Fatalf("body = %v, want %v", got.Body, want)
 	}
 }
 

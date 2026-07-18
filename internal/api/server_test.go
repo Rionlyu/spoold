@@ -65,6 +65,37 @@ func TestConflictingIdempotencyKeyReturnsConflict(t *testing.T) {
 	}
 }
 
+func TestCreateAcceptsBase64Body(t *testing.T) {
+	server, journal := newTestServer(t)
+	got := request(t, server, http.MethodPost, "/v1/deliveries", `{
+		"targetUrl":"https://example.com/upload",
+		"bodyBase64":"AP8Q"
+	}`)
+	if got.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+	}
+	items := journal.List("")
+	if len(items) != 1 || !bytes.Equal(items[0].Body, []byte{0x00, 0xff, 0x10}) {
+		t.Fatalf("deliveries = %#v", items)
+	}
+	if !strings.Contains(got.Body.String(), `"bodyBase64":"AP8Q"`) {
+		t.Fatalf("response body = %s", got.Body.String())
+	}
+}
+
+func TestCreateRejectsAmbiguousOrInvalidBase64Body(t *testing.T) {
+	server, _ := newTestServer(t)
+	for _, body := range []string{
+		`{"targetUrl":"https://example.com","body":{},"bodyBase64":"e30="}`,
+		`{"targetUrl":"https://example.com","bodyBase64":"not base64"}`,
+	} {
+		got := request(t, server, http.MethodPost, "/v1/deliveries", body)
+		if got.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, body = %s", got.Code, got.Body.String())
+		}
+	}
+}
+
 func TestCancelDeliveryAndFilterList(t *testing.T) {
 	server, _ := newTestServer(t)
 	created := request(t, server, http.MethodPost, "/v1/deliveries", `{"targetUrl":"https://example.com"}`)
@@ -80,6 +111,32 @@ func TestCancelDeliveryAndFilterList(t *testing.T) {
 	list := request(t, server, http.MethodGet, "/v1/deliveries?status=canceled", "")
 	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), item.ID) {
 		t.Fatalf("list status = %d, body = %s", list.Code, list.Body.String())
+	}
+}
+
+func TestListOmitsPayloadWhileGetReturnsIt(t *testing.T) {
+	server, _ := newTestServer(t)
+	created := request(t, server, http.MethodPost, "/v1/deliveries", `{
+		"targetUrl":"https://example.com",
+		"headers":{"X-Secret":"value"},
+		"bodyBase64":"AP8Q"
+	}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var item delivery.Delivery
+	if err := json.Unmarshal(created.Body.Bytes(), &item); err != nil {
+		t.Fatal(err)
+	}
+
+	list := request(t, server, http.MethodGet, "/v1/deliveries", "")
+	if strings.Contains(list.Body.String(), "bodyBase64") || strings.Contains(list.Body.String(), "X-Secret") {
+		t.Fatalf("list exposed payload: %s", list.Body.String())
+	}
+	get := request(t, server, http.MethodGet, "/v1/deliveries/"+item.ID, "")
+	if !strings.Contains(get.Body.String(), `"bodyBase64":"AP8Q"`) ||
+		!strings.Contains(get.Body.String(), `"X-Secret":"value"`) {
+		t.Fatalf("get omitted payload: %s", get.Body.String())
 	}
 }
 
@@ -111,7 +168,7 @@ func TestReadinessReflectsJournalAvailability(t *testing.T) {
 }
 
 func TestCreateReturnsInsufficientStorageAtAdmissionLimit(t *testing.T) {
-	journal, err := store.OpenWithOptions(filepath.Join(t.TempDir(), "journal"), store.Options{
+	journal, err := store.Open(filepath.Join(t.TempDir(), "journal"), store.Options{
 		MaxJournalBytes: 1,
 	})
 	if err != nil {

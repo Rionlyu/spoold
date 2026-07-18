@@ -3,10 +3,12 @@ package delivery
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,6 +17,8 @@ import (
 )
 
 type Status string
+
+const MaxBodyBytes = 1 << 20
 
 const (
 	StatusPending   Status = "pending"
@@ -30,7 +34,7 @@ type Delivery struct {
 	TargetURL        string            `json:"targetUrl"`
 	Method           string            `json:"method"`
 	Headers          map[string]string `json:"headers,omitempty"`
-	Body             json.RawMessage   `json:"body,omitempty"`
+	Body             []byte            `json:"-"`
 	Status           Status            `json:"status"`
 	Attempts         int               `json:"attempts"`
 	MaxAttempts      int               `json:"maxAttempts"`
@@ -47,7 +51,7 @@ type CreateRequest struct {
 	TargetURL      string
 	Method         string
 	Headers        map[string]string
-	Body           json.RawMessage
+	Body           []byte
 	MaxAttempts    int
 }
 
@@ -80,7 +84,7 @@ func New(req CreateRequest, now time.Time) (Delivery, string, error) {
 
 func Clone(d Delivery) Delivery {
 	d.Headers = cloneHeaders(d.Headers)
-	d.Body = append(json.RawMessage(nil), d.Body...)
+	d.Body = append([]byte(nil), d.Body...)
 	return d
 }
 
@@ -88,8 +92,10 @@ func (d Delivery) MarshalJSON() ([]byte, error) {
 	type alias Delivery
 	value := struct {
 		alias
-		NextAttemptAt *time.Time `json:"nextAttemptAt,omitempty"`
-		LeaseUntil    *time.Time `json:"leaseUntil,omitempty"`
+		NextAttemptAt *time.Time      `json:"nextAttemptAt,omitempty"`
+		LeaseUntil    *time.Time      `json:"leaseUntil,omitempty"`
+		Body          json.RawMessage `json:"body,omitempty"`
+		BodyBase64    string          `json:"bodyBase64,omitempty"`
 	}{
 		alias: alias(d),
 	}
@@ -99,7 +105,41 @@ func (d Delivery) MarshalJSON() ([]byte, error) {
 	if !d.LeaseUntil.IsZero() {
 		value.LeaseUntil = &d.LeaseUntil
 	}
+	if len(d.Body) > 0 {
+		if json.Valid(d.Body) {
+			value.Body = append(json.RawMessage(nil), d.Body...)
+		} else {
+			value.BodyBase64 = base64.StdEncoding.EncodeToString(d.Body)
+		}
+	}
 	return json.Marshal(value)
+}
+
+func (d *Delivery) UnmarshalJSON(data []byte) error {
+	type alias Delivery
+	value := struct {
+		alias
+		Body       json.RawMessage `json:"body"`
+		BodyBase64 *string         `json:"bodyBase64"`
+	}{}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if len(value.Body) > 0 && value.BodyBase64 != nil {
+		return errors.New("delivery contains both body and bodyBase64")
+	}
+
+	body := append([]byte(nil), value.Body...)
+	if value.BodyBase64 != nil {
+		decoded, err := base64.StdEncoding.Strict().DecodeString(*value.BodyBase64)
+		if err != nil {
+			return fmt.Errorf("decode delivery bodyBase64: %w", err)
+		}
+		body = decoded
+	}
+	*d = Delivery(value.alias)
+	d.Body = body
+	return nil
 }
 
 func normalize(req CreateRequest) (CreateRequest, error) {
@@ -166,14 +206,18 @@ func normalize(req CreateRequest) (CreateRequest, error) {
 	}
 	req.Headers = normalizedHeaders
 
-	if len(req.Body) > 0 && !json.Valid(req.Body) {
-		return CreateRequest{}, errors.New("body must be valid JSON")
+	if len(req.Body) > MaxBodyBytes {
+		return CreateRequest{}, fmt.Errorf("body must not exceed %d bytes", MaxBodyBytes)
 	}
-	req.Body = append(json.RawMessage(nil), req.Body...)
+	req.Body = append([]byte(nil), req.Body...)
 	return req, nil
 }
 
 func fingerprint(req CreateRequest) string {
+	if len(req.Body) > 0 && !json.Valid(req.Body) {
+		return binaryFingerprint(req)
+	}
+
 	hash := sha256.New()
 	fmt.Fprintf(hash, "%s\n%s\n%d\n", req.Method, req.TargetURL, req.MaxAttempts)
 	names := make([]string, 0, len(req.Headers))
@@ -186,6 +230,32 @@ func fingerprint(req CreateRequest) string {
 	}
 	hash.Write(req.Body)
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func binaryFingerprint(req CreateRequest) string {
+	hash := sha256.New()
+	hash.Write([]byte("spoold-request-v2\x00"))
+	writeFingerprintField(hash, req.Method)
+	writeFingerprintField(hash, req.TargetURL)
+	writeFingerprintField(hash, fmt.Sprint(req.MaxAttempts))
+
+	names := make([]string, 0, len(req.Headers))
+	for name := range req.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprintf(hash, "%d:", len(names))
+	for _, name := range names {
+		writeFingerprintField(hash, name)
+		writeFingerprintField(hash, req.Headers[name])
+	}
+	fmt.Fprintf(hash, "%d:", len(req.Body))
+	hash.Write(req.Body)
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func writeFingerprintField(writer io.Writer, value string) {
+	fmt.Fprintf(writer, "%d:%s", len(value), value)
 }
 
 func newID() (string, error) {

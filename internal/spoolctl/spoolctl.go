@@ -3,11 +3,13 @@ package spoolctl
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +24,6 @@ import (
 const (
 	defaultServer = "http://127.0.0.1:8080"
 	maxResponse   = 2 << 20
-	maxInputBody  = 1 << 20
 )
 
 var errHelp = errors.New("help requested")
@@ -41,6 +42,7 @@ type createRequest struct {
 	Method         string            `json:"method,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	Body           json.RawMessage   `json:"body,omitempty"`
+	BodyBase64     string            `json:"bodyBase64,omitempty"`
 	MaxAttempts    int               `json:"maxAttempts,omitempty"`
 }
 
@@ -71,6 +73,7 @@ func (e apiError) Error() string {
 
 type client struct {
 	baseURL    *url.URL
+	displayURL string
 	httpClient *http.Client
 }
 
@@ -133,6 +136,7 @@ func runSend(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	maxAttempts := flags.Int("max-attempts", 0, "maximum delivery attempts (server default: 8)")
 	data := flags.String("data", "", "JSON request body")
 	dataFile := flags.String("data-file", "", "read JSON request body from a file, or - for stdin")
+	dataBinary := flags.String("data-binary", "", "read an arbitrary request body from a file, or - for stdin")
 	jsonOutput := flags.Bool("json", false, "print the API response as JSON")
 	headers := make(headerValues)
 	flags.Var(&headers, "header", "outbound header in 'Name: value' form; repeatable")
@@ -148,15 +152,26 @@ func runSend(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		flags.Usage()
 		return usageError{errors.New("send requires exactly one target URL")}
 	}
-	if *data != "" && *dataFile != "" {
-		return usageError{errors.New("--data and --data-file cannot be used together")}
+	bodySources := 0
+	for _, source := range []string{*data, *dataFile, *dataBinary} {
+		if source != "" {
+			bodySources++
+		}
+	}
+	if bodySources > 1 {
+		return usageError{errors.New("--data, --data-file, and --data-binary cannot be used together")}
 	}
 
-	body, err := readBody(*data, *dataFile, stdin)
+	bodyPath := *dataFile
+	if *dataBinary != "" {
+		bodyPath = *dataBinary
+	}
+	body, err := readBody(*data, bodyPath, stdin)
 	if err != nil {
 		return err
 	}
-	if len(body) > 0 && !json.Valid(body) {
+	binaryBody := *dataBinary != ""
+	if !binaryBody && len(body) > 0 && !json.Valid(body) {
 		return usageError{errors.New("request body must be valid JSON")}
 	}
 
@@ -165,17 +180,22 @@ func runSend(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return usageError{err}
 	}
 	var item delivery.Delivery
+	payload := createRequest{
+		IdempotencyKey: *idempotencyKey,
+		TargetURL:      flags.Arg(0),
+		Method:         *method,
+		Headers:        headers,
+		MaxAttempts:    *maxAttempts,
+	}
+	if binaryBody {
+		payload.BodyBase64 = base64.StdEncoding.EncodeToString(body)
+	} else {
+		payload.Body = body
+	}
 	status, err := api.do(ctx, apiRequest{
 		method: http.MethodPost,
 		path:   "/v1/deliveries",
-		body: createRequest{
-			IdempotencyKey: *idempotencyKey,
-			TargetURL:      flags.Arg(0),
-			Method:         *method,
-			Headers:        headers,
-			Body:           body,
-			MaxAttempts:    *maxAttempts,
-		},
+		body:   payload,
 	}, &item)
 	if err != nil {
 		return err
@@ -318,12 +338,12 @@ func readBody(inline, path string, stdin io.Reader) (json.RawMessage, error) {
 		defer file.Close()
 		reader = file
 	}
-	body, err := io.ReadAll(io.LimitReader(reader, maxInputBody+1))
+	body, err := io.ReadAll(io.LimitReader(reader, delivery.MaxBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read request body: %w", err)
 	}
-	if len(body) > maxInputBody {
-		return nil, fmt.Errorf("request body exceeds %d bytes", maxInputBody)
+	if len(body) > delivery.MaxBodyBytes {
+		return nil, fmt.Errorf("request body exceeds %d bytes", delivery.MaxBodyBytes)
 	}
 	return json.RawMessage(body), nil
 }
@@ -380,12 +400,16 @@ func serverURL() string {
 }
 
 func newClient(rawURL string) (*client, error) {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	rawURL = strings.TrimSpace(rawURL)
+	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse --server: %w", err)
 	}
+	if parsed.Scheme == "unix" {
+		return newUnixClient(rawURL, parsed)
+	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, errors.New("--server must use http or https")
+		return nil, errors.New("--server must use http, https, or unix")
 	}
 	if parsed.Host == "" {
 		return nil, errors.New("--server must include a host")
@@ -395,7 +419,8 @@ func newClient(rawURL string) (*client, error) {
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	return &client{
-		baseURL: parsed,
+		baseURL:    parsed,
+		displayURL: rawURL,
 		httpClient: &http.Client{
 			Timeout: 20 * time.Second,
 		},
@@ -426,7 +451,7 @@ func (c *client) do(ctx context.Context, spec apiRequest, responseBody any) (int
 
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return 0, fmt.Errorf("contact spoold at %s: %w", c.baseURL, err)
+		return 0, fmt.Errorf("contact spoold at %s: %w", c.displayURL, err)
 	}
 	defer response.Body.Close()
 	responseData, err := io.ReadAll(io.LimitReader(response.Body, maxResponse+1))
@@ -458,6 +483,35 @@ func (c *client) do(ctx context.Context, spec apiRequest, responseBody any) (int
 		return response.StatusCode, fmt.Errorf("decode spoold response: %w", err)
 	}
 	return response.StatusCode, nil
+}
+
+func newUnixClient(rawURL string, parsed *url.URL) (*client, error) {
+	if parsed.Host != "" || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") {
+		return nil, errors.New("unix --server must contain an absolute socket path")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("unix --server must not include user information, a query, or a fragment")
+	}
+
+	socketPath := parsed.Path
+	dialer := &net.Dialer{Timeout: 20 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "unix", socketPath)
+	}
+	baseURL, err := url.Parse("http://spoold")
+	if err != nil {
+		return nil, err
+	}
+	return &client{
+		baseURL:    baseURL,
+		displayURL: rawURL,
+		httpClient: &http.Client{
+			Transport: transport,
+			Timeout:   20 * time.Second,
+		},
+	}, nil
 }
 
 type headerValues map[string]string

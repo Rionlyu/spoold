@@ -77,12 +77,15 @@ const (
 	compactionAfterDirSync compactionStage = "after_directory_sync"
 )
 
-func Open(path string) (*Store, error) {
-	return OpenWithOptions(path, Options{})
-}
-
-func OpenWithOptions(path string, options Options) (*Store, error) {
-	if options.MaxJournalBytes < 0 {
+func Open(path string, options ...Options) (*Store, error) {
+	if len(options) > 1 {
+		return nil, errors.New("only one store options value is supported")
+	}
+	cfg := Options{}
+	if len(options) == 1 {
+		cfg = options[0]
+	}
+	if cfg.MaxJournalBytes < 0 {
 		return nil, errors.New("maximum journal size must not be negative")
 	}
 	dir := filepath.Dir(path)
@@ -130,7 +133,7 @@ func OpenWithOptions(path string, options Options) (*Store, error) {
 		items:           make(map[string]delivery.Delivery),
 		hashes:          make(map[string]string),
 		keyToID:         make(map[string]string),
-		maxJournalBytes: options.MaxJournalBytes,
+		maxJournalBytes: cfg.MaxJournalBytes,
 	}
 	if err := store.replay(); err != nil {
 		file.Close()
@@ -213,6 +216,15 @@ func (s *Store) List(status delivery.Status) []delivery.Delivery {
 }
 
 func (s *Store) ClaimDue(now time.Time, leaseDuration time.Duration, limit int) ([]delivery.Delivery, error) {
+	return s.ClaimDueMatching(now, leaseDuration, limit, nil)
+}
+
+func (s *Store) ClaimDueMatching(
+	now time.Time,
+	leaseDuration time.Duration,
+	limit int,
+	eligible func(delivery.Delivery) bool,
+) ([]delivery.Delivery, error) {
 	if limit < 1 {
 		return nil, nil
 	}
@@ -224,7 +236,7 @@ func (s *Store) ClaimDue(now time.Time, leaseDuration time.Duration, limit int) 
 	for _, item := range s.items {
 		pending := item.Status == delivery.StatusPending && !item.NextAttemptAt.After(now)
 		expired := item.Status == delivery.StatusInFlight && !item.LeaseUntil.After(now)
-		if pending || expired {
+		if (pending || expired) && (eligible == nil || eligible(delivery.Clone(item))) {
 			candidates = append(candidates, item)
 		}
 	}

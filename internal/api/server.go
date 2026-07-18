@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 	"github.com/Rionlyu/spoold/internal/worker"
 )
 
-const maxRequestBody = 1 << 20
+const maxRequestBody = 2 << 20
 
 type metricsSource interface {
 	Metrics() worker.Metrics
@@ -34,6 +35,7 @@ type createRequest struct {
 	Method         string            `json:"method"`
 	Headers        map[string]string `json:"headers"`
 	Body           json.RawMessage   `json:"body"`
+	BodyBase64     *string           `json:"bodyBase64"`
 	MaxAttempts    int               `json:"maxAttempts"`
 }
 
@@ -73,13 +75,18 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	body, err := requestBody(payload)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 
 	item, created, err := s.store.Create(delivery.CreateRequest{
 		IdempotencyKey: payload.IdempotencyKey,
 		TargetURL:      payload.TargetURL,
 		Method:         payload.Method,
 		Headers:        payload.Headers,
-		Body:           payload.Body,
+		Body:           body,
 		MaxAttempts:    payload.MaxAttempts,
 	}, time.Now())
 	if err != nil {
@@ -108,6 +115,20 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, item)
 }
 
+func requestBody(payload createRequest) ([]byte, error) {
+	if len(payload.Body) > 0 && payload.BodyBase64 != nil {
+		return nil, errors.New("body and bodyBase64 cannot be used together")
+	}
+	if payload.BodyBase64 == nil {
+		return append([]byte(nil), payload.Body...), nil
+	}
+	body, err := base64.StdEncoding.Strict().DecodeString(*payload.BodyBase64)
+	if err != nil {
+		return nil, errors.New("bodyBase64 must contain valid standard base64")
+	}
+	return body, nil
+}
+
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	status := delivery.Status(r.URL.Query().Get("status"))
 	if status != "" && !validStatus(status) {
@@ -128,6 +149,10 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	items := s.store.List(status)
 	if len(items) > limit {
 		items = items[:limit]
+	}
+	for index := range items {
+		items[index].Headers = nil
+		items[index].Body = nil
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"deliveries": items,
