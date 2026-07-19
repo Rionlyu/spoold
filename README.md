@@ -8,6 +8,8 @@ disk before acknowledging the request, delivers it in the background, and
 resumes bounded retries after process termination, reboot, destination failure,
 or network loss.
 
+![A delivery is queued while its destination is offline, survives a forced spoold termination, and succeeds after restart.](demo/spoold-v0.1.0-crash-recovery.gif)
+
 It is intentionally a local delivery spool, not a hosted webhook platform or
 general message broker. One self-contained daemon and one owner-only journal
 provide the reliability boundary without PostgreSQL, Redis, Kafka, a cloud

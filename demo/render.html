@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>spoold v0.1.0 crash-recovery demo</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #0a0c0f;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="demo" width="1440" height="900"></canvas>
+  <script>
+    const canvas = document.querySelector("#demo");
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+    const duration = 23;
+    const deliveryID = "83a1f1a19caeb884abd0408d6890e5d5";
+
+    const colors = {
+      background: "#0a0c0f",
+      panel: "#0a0c0f",
+      panelTop: "#0f1216",
+      border: "#262b33",
+      white: "#e6edf3",
+      text: "#c9d1d9",
+      muted: "#767d88",
+      green: "#56d364",
+      amber: "#d2a844",
+      red: "#ff6b6b"
+    };
+
+    const daemonLines = [
+      { at: 1.1, text: "$ spoold -journal ./demo.journal \\", color: colors.white, write: 1.15 },
+      { at: 2.35, text: "    -allow-private-targets -workers 1", color: colors.white, write: 0.85 },
+      { at: 3.45, text: "INFO   spoold started", color: colors.text },
+      { at: 3.85, text: "       journal=./demo.journal  listen=127.0.0.1:8080", color: colors.muted },
+      { at: 9.45, text: "INFO   delivery scheduled for retry", color: colors.amber },
+      { at: 9.85, text: `       id=${deliveryID}  attempt=1`, color: colors.muted },
+      { at: 14.9, text: "$ spoold -journal ./demo.journal \\", color: colors.white, write: 0.8 },
+      { at: 15.75, text: "    -allow-private-targets -workers 1", color: colors.white, write: 0.55 },
+      { at: 16.55, text: "INFO   spoold started", color: colors.text },
+      { at: 16.95, text: "       journal=./demo.journal", color: colors.muted },
+      { at: 18.1, text: "INFO   delivery succeeded", color: colors.green },
+      { at: 18.5, text: `       id=${deliveryID}  attempt=2  status=204`, color: colors.text }
+    ];
+
+    const targetLines = [
+      { at: 4.4, text: "$ curl --max-time 1 127.0.0.1:9090/events", color: colors.white, write: 1.25 },
+      { at: 5.85, text: "curl: (7) Failed to connect", color: colors.red },
+      { at: 13.55, text: "$ ./receiver", color: colors.white, write: 0.6 },
+      { at: 14.35, text: "receiver listening on 127.0.0.1:9090", color: colors.text },
+      { at: 18.72, text: `delivery=${deliveryID}`, color: colors.green },
+      { at: 19.08, text: "attempt=2", color: colors.text },
+      { at: 19.36, text: "event=map[repository:spoold result:passed]", color: colors.text }
+    ];
+
+    const clientLines = [
+      { at: 6.55, text: "$ spoolctl send --idempotency-key launch-demo-v010 \\", color: colors.white, write: 0.8 },
+      { at: 7.38, text: "    --data '{\"repository\":\"spoold\",\"result\":\"passed\"}' \\", color: colors.white, write: 0.72 },
+      { at: 8.12, text: "    --max-attempts 20 http://127.0.0.1:9090/events", color: colors.white, write: 0.62 },
+      { at: 8.88, text: `queued  ${deliveryID}  pending  0/20  POST  http://127.0.0.1:9090/events`, color: colors.green },
+      { at: 10.35, text: "$ spoolctl list", color: colors.white, write: 0.45 },
+      { at: 10.9, text: "ID                                STATUS   ATTEMPTS  METHOD  TARGET", color: colors.muted },
+      { at: 11.22, text: `${deliveryID}  pending  1/20      POST    http://127.0.0.1:9090/events`, color: colors.amber },
+      { at: 12.05, text: "$ kill -9 $(cat /tmp/spoold.pid)", color: colors.red, write: 0.55 },
+      { at: 20.05, text: "$ spoolctl list", color: colors.white, write: 0.45 },
+      { at: 20.62, text: "ID                                STATUS     ATTEMPTS  METHOD  TARGET", color: colors.muted },
+      { at: 20.96, text: `${deliveryID}  succeeded  2/20      POST    http://127.0.0.1:9090/events`, color: colors.green }
+    ];
+
+    function roundedRect(x, y, w, h, radius) {
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, radius);
+    }
+
+    function drawPanel(x, y, w, h, title) {
+      ctx.fillStyle = colors.panel;
+      roundedRect(x, y, w, h, 6);
+      ctx.fill();
+
+      ctx.strokeStyle = colors.border;
+      ctx.lineWidth = 1;
+      roundedRect(x + 0.5, y + 0.5, w - 1, h - 1, 6);
+      ctx.stroke();
+
+      ctx.save();
+      roundedRect(x, y, w, h, 6);
+      ctx.clip();
+      ctx.fillStyle = colors.panelTop;
+      ctx.fillRect(x, y, w, 40);
+      ctx.restore();
+
+      ctx.font = "400 13px Menlo, monospace";
+      ctx.fillStyle = colors.muted;
+      ctx.textBaseline = "middle";
+      ctx.fillText(title, x + 16, y + 20);
+    }
+
+    function drawLines(lines, x, y, w, h, time, fontSize, lineHeight) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      ctx.clip();
+      const capacity = Math.floor(h / lineHeight);
+      const visibleLines = lines.filter(line => time >= line.at).slice(-capacity);
+      for (let row = 0; row < visibleLines.length; row++) {
+        const line = visibleLines[row];
+        const age = time - line.at;
+        const alpha = Math.min(1, age / 0.18);
+        let visible = line.text;
+        let typing = false;
+        if (line.write) {
+          const portion = Math.min(1, age / line.write);
+          visible = line.text.slice(0, Math.ceil(line.text.length * portion));
+          typing = portion < 1;
+        }
+
+        ctx.globalAlpha = alpha;
+        ctx.font = `400 ${fontSize}px Menlo, monospace`;
+        ctx.textBaseline = "top";
+        ctx.fillStyle = line.color;
+        ctx.fillText(visible, x, y + row * lineHeight);
+
+        if (typing && Math.floor(time * 4) % 2 === 0) {
+          const cursorX = x + ctx.measureText(visible).width + 2;
+          ctx.fillStyle = colors.white;
+          ctx.fillRect(cursorX, y + row * lineHeight + 2, Math.max(2, fontSize * 0.52), fontSize + 2);
+        }
+      }
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    function drawFrame(time) {
+      const t = Math.max(0, Math.min(duration, time + 0.9));
+      ctx.clearRect(0, 0, width, height);
+
+      ctx.fillStyle = colors.background;
+      ctx.fillRect(0, 0, width, height);
+
+      drawPanel(24, 24, 880, 480, "spoold");
+      drawPanel(920, 24, 496, 480, "destination");
+      drawPanel(24, 520, 1392, 356, "client");
+
+      drawLines(daemonLines, 44, 80, 840, 404, t, 17, 25);
+      drawLines(targetLines, 940, 80, 456, 404, t, 14, 24);
+      drawLines(clientLines, 44, 576, 1352, 280, t, 16, 23);
+    }
+
+    window.drawFrame = drawFrame;
+    drawFrame(0);
+
+    window.startRecording = async function startRecording() {
+      const stream = canvas.captureStream(30);
+      const mimeType = "video/mp4;codecs=avc1.42E01E";
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        throw new Error(`${mimeType} is unavailable`);
+      }
+
+      const chunks = [];
+      const recorder = new MediaRecorder(stream, {
+        mimeType,
+        videoBitsPerSecond: 5000000
+      });
+      recorder.addEventListener("dataavailable", event => {
+        if (event.data.size > 0) chunks.push(event.data);
+      });
+
+      const stopped = new Promise(resolve => recorder.addEventListener("stop", resolve, { once: true }));
+      recorder.start(1000);
+      const start = performance.now();
+
+      await new Promise(resolve => {
+        function animate(now) {
+          const elapsed = (now - start) / 1000;
+          drawFrame(elapsed);
+          if (elapsed < duration) {
+            requestAnimationFrame(animate);
+          } else {
+            setTimeout(resolve, 700);
+          }
+        }
+        requestAnimationFrame(animate);
+      });
+
+      recorder.stop();
+      await stopped;
+      const blob = new Blob(chunks, { type: "video/mp4" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "spoold-v0.1.0-crash-recovery.mp4";
+      link.click();
+      return { size: blob.size, type: blob.type };
+    };
+  </script>
+</body>
+</html>
