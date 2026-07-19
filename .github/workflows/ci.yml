@@ -47,10 +47,11 @@ jobs:
           grep -q '/spoold$' "$listing"
           grep -q '/spoolctl$' "$listing"
           (cd dist && sha256sum --check checksums.txt)
+          version="$(jq -r .version dist/metadata.json)"
           unpacked="$(mktemp -d)"
           tar -xzf "$archive" -C "$unpacked"
-          "$(find "$unpacked" -type f -name spoold)" -version | grep -q 'spoold 0.0.0-SNAPSHOT'
-          "$(find "$unpacked" -type f -name spoolctl)" version | grep -q 'spoolctl 0.0.0-SNAPSHOT'
+          "$(find "$unpacked" -type f -name spoold)" -version | grep -Fq "spoold ${version}"
+          "$(find "$unpacked" -type f -name spoolctl)" version | grep -Fq "spoolctl ${version}"
       - name: Verify installer
         run: |
           installed="$(mktemp -d)"
@@ -63,9 +64,10 @@ jobs:
           "$installed/spoolctl" version | grep -q "spoolctl ${version}"
       - name: Verify release container
         run: |
+          version="$(jq -r .version dist/metadata.json)"
           image="$(docker image ls ghcr.io/rionlyu/spoold --format '{{.Repository}}:{{.Tag}}' | grep -- '-amd64$' | head -n 1)"
           test -n "$image"
-          docker run --rm "$image" -version | grep -q 'spoold 0.0.0-SNAPSHOT'
+          docker run --rm "$image" -version | grep -Fq "spoold ${version}"
           docker volume create spoold-ci-data
           trap 'docker rm -f spoold-release-ci >/dev/null 2>&1 || true; docker volume rm spoold-ci-data >/dev/null 2>&1 || true' EXIT
           docker run -d \
